@@ -1,6 +1,10 @@
 use anyhow::{Result, anyhow, bail};
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    fmt::{self, Display},
+};
 
+#[derive(Debug)]
 pub enum Type {
     Init,
     InitOk,
@@ -8,16 +12,19 @@ pub enum Type {
     Error,
 }
 
-impl Type {
-    fn to_string(self: &Self) -> String {
-        match self {
-            Type::Init => "init".to_string(),
-            Type::InitOk => "init_ok".to_string(),
-            Type::Echo => "echo".to_string(),
-            Type::Error => "error".to_string(),
-        }
+impl Display for Type {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let str = match self {
+            Type::Init => "init",
+            Type::InitOk => "init_ok",
+            Type::Echo => "echo",
+            Type::Error => "error",
+        };
+        f.write_str(str)
     }
+}
 
+impl Type {
     fn of_string(str: &str) -> Result<Self> {
         let type_ = match str {
             "init" => Type::Init,
@@ -30,13 +37,14 @@ impl Type {
     }
 }
 
+#[derive(Debug)]
 pub struct Message {
     src: String,
     dest: String,
-    type_: Type,
     message_id: Option<u64>,
     in_reply_to: Option<u64>,
-    data: HashMap<String, String>,
+    pub type_: Type,
+    pub data: HashMap<String, String>,
 }
 
 impl Message {
@@ -55,6 +63,9 @@ impl Message {
             .as_object()
             .ok_or_else(|| anyhow!("body field not found"))?;
 
+        let message_id = body.get("msg_id").and_then(|v| v.as_u64());
+        let in_reply_to = body.get("in_reply_to").and_then(|v| v.as_u64());
+
         let type_ = body["type"]
             .as_str()
             .ok_or_else(|| anyhow!("type field not found"))?;
@@ -63,9 +74,6 @@ impl Message {
             "echo" => Type::Echo,
             other => bail!("unknown type: {other}"),
         };
-
-        let message_id = body.get("message_id").and_then(|v| v.as_u64());
-        let in_reply_to = body.get("in_reply_to").and_then(|v| v.as_u64());
 
         let data: HashMap<String, String> = body
             .iter()
@@ -76,32 +84,54 @@ impl Message {
         Ok(Message {
             src,
             dest,
-            type_,
             message_id,
             in_reply_to,
+            type_,
             data,
         })
     }
 
-    pub fn to_string(self: Self) -> String {
+    pub fn build_reply(
+        &self,
+        message_id: u64,
+        type_: Type,
+        data: HashMap<String, String>,
+    ) -> Result<Message> {
+        let in_reply_to = self
+            .message_id
+            .ok_or_else(|| anyhow!("attempted to build reply to a message with no id"))?;
+        Ok(Message {
+            src: self.dest.clone(),
+            dest: self.src.clone(),
+            message_id: Some(message_id),
+            in_reply_to: Some(in_reply_to),
+            type_,
+            data,
+        })
+    }
+}
+
+impl Display for Message {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use serde_json::*;
         let mut map = Map::new();
-        map["src"] = Value::String(self.src);
-        map["dest"] = Value::String(self.dest);
+        map.insert("src".into(), Value::String(self.src.clone()));
+        map.insert("dest".into(), Value::String(self.dest.clone()));
 
         let mut body = Map::new();
-        body["type"] = Value::String(self.type_.to_string());
+        body.insert("type".into(), Value::String(self.type_.to_string()));
         if let Some(message_id) = self.message_id {
-            body["message_id"] = Value::Number(message_id.into());
+            body.insert("message_id".into(), Value::Number(message_id.into()));
         }
         if let Some(in_reply_to) = self.in_reply_to {
-            body["in_reply_to"] = Value::Number(in_reply_to.into());
+            body.insert("in_reply_to".into(), Value::Number(in_reply_to.into()));
         }
         self.data.iter().for_each(|(key, value)| {
-            body[key] = Value::String(value.to_string());
+            body.insert(key.clone(), Value::String(value.to_string()));
         });
-        map["body"] = Value::Object(body);
+        map.insert("body".into(), Value::Object(body));
 
-        Value::to_string(&Value::Object(map))
+        let str = Value::to_string(&Value::Object(map));
+        f.write_str(&str)
     }
 }
