@@ -4,7 +4,6 @@ use std::collections::HashMap;
 
 use anyhow::{Result, anyhow, bail};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::select;
 use tokio::sync::mpsc;
 
 use crate::message::Message;
@@ -13,6 +12,21 @@ use crate::message::Message;
 struct Node {
     node_id: String,
     message_id: u64,
+}
+
+impl Node {
+    fn create(node_id: String) -> Self {
+        Node {
+            node_id,
+            message_id: 1,
+        }
+    }
+
+    fn new_message_id(&mut self) -> u64 {
+        let ret = self.message_id;
+        self.message_id += 1;
+        ret
+    }
 }
 
 #[tokio::main]
@@ -56,25 +70,38 @@ async fn run_node(mut rx: mpsc::Receiver<Message>, tx: mpsc::Sender<Message>) ->
         .await
         .ok_or_else(|| anyhow!("failed to receive init message"))?;
 
-    let node = match init_msg.type_ {
+    let mut node = match init_msg.type_ {
         message::Type::Init => {
             let node_id = init_msg
                 .data
                 .get("node_id")
                 .ok_or_else(|| anyhow!("init msg didn't have node id"))?
                 .clone();
-            let reply = init_msg.build_reply(1, message::Type::InitOk, HashMap::new())?;
-            tx.clone().send(reply).await?;
-            Node {
-                node_id,
-                message_id: 2,
-            }
+            let mut node = Node::create(node_id);
+            let reply = init_msg.build_reply(
+                node.new_message_id(),
+                message::Type::InitOk,
+                HashMap::new(),
+            )?;
+            tx.send(reply).await?;
+            node
         }
         other => bail!("received non-init message {:?}", other),
     };
 
     while let Some(msg) = rx.recv().await {
-        eprintln!("handling {:?} on {:?}", msg, node);
+        match msg.type_ {
+            message::Type::Echo => {
+                let echo_msg = msg.data["echo"].clone();
+                let reply = msg.build_reply(
+                    node.new_message_id(),
+                    message::Type::EchoOk,
+                    HashMap::from([("echo".to_string(), echo_msg)]),
+                )?;
+                tx.send(reply).await?;
+            }
+            other => bail!("received unimplemented message {:?}", other),
+        }
     }
 
     Ok(())

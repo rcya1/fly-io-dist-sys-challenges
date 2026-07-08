@@ -9,6 +9,7 @@ pub enum Type {
     Init,
     InitOk,
     Echo,
+    EchoOk,
     Error,
 }
 
@@ -18,6 +19,7 @@ impl Display for Type {
             Type::Init => "init",
             Type::InitOk => "init_ok",
             Type::Echo => "echo",
+            Type::EchoOk => "echo_ok",
             Type::Error => "error",
         };
         f.write_str(str)
@@ -30,6 +32,7 @@ impl Type {
             "init" => Type::Init,
             "init_ok" => Type::InitOk,
             "echo" => Type::Echo,
+            "echo_ok" => Type::EchoOk,
             "error" => Type::Error,
             s => bail!("received unknown type {:?}", s),
         };
@@ -121,7 +124,7 @@ impl Display for Message {
         let mut body = Map::new();
         body.insert("type".into(), Value::String(self.type_.to_string()));
         if let Some(message_id) = self.message_id {
-            body.insert("message_id".into(), Value::Number(message_id.into()));
+            body.insert("msg_id".into(), Value::Number(message_id.into()));
         }
         if let Some(in_reply_to) = self.in_reply_to {
             body.insert("in_reply_to".into(), Value::Number(in_reply_to.into()));
