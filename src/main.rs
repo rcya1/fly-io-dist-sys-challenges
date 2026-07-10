@@ -12,6 +12,7 @@ use crate::message::Message;
 struct Node {
     node_id: String,
     message_id: u64,
+    generate_counter: u64,
 }
 
 impl Node {
@@ -19,6 +20,7 @@ impl Node {
         Node {
             node_id,
             message_id: 1,
+            generate_counter: 0,
         }
     }
 
@@ -44,26 +46,18 @@ async fn main() {
 async fn run() -> Result<()> {
     let (input_tx, input_rx) = mpsc::channel::<Message>(1024);
     let (output_tx, output_rx) = mpsc::channel::<Message>(1024);
-
     let stdin_handle = tokio::spawn(read_stdin_task(input_tx));
     let stdout_handle = tokio::spawn(write_stdout_task(output_rx));
     let node_handle = tokio::spawn(run_node(input_rx, output_tx));
 
-    tokio::select! {
-        res = stdin_handle => {
-            res??;
-        }
-        res = stdout_handle => {
-            res??;
-        }
-        res = node_handle => {
-            res??;
-        }
-    }
+    let (stdin_res, stdout_res, node_res) =
+        tokio::try_join!(stdin_handle, stdout_handle, node_handle)?;
+    stdin_res?;
+    stdout_res?;
+    node_res?;
 
     Ok(())
 }
-
 async fn run_node(mut rx: mpsc::Receiver<Message>, tx: mpsc::Sender<Message>) -> Result<()> {
     let init_msg = rx
         .recv()
@@ -97,6 +91,16 @@ async fn run_node(mut rx: mpsc::Receiver<Message>, tx: mpsc::Sender<Message>) ->
                     node.new_message_id(),
                     message::Type::EchoOk,
                     HashMap::from([("echo".to_string(), echo_msg)]),
+                )?;
+                tx.send(reply).await?;
+            }
+            message::Type::Generate => {
+                let id = format!("{}-{}", node.node_id, node.generate_counter);
+                node.generate_counter += 1;
+                let reply = msg.build_reply(
+                    node.new_message_id(),
+                    message::Type::GenerateOk,
+                    HashMap::from([("id".to_string(), id)]),
                 )?;
                 tx.send(reply).await?;
             }

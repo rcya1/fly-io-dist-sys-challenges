@@ -10,6 +10,8 @@ pub enum Type {
     InitOk,
     Echo,
     EchoOk,
+    Generate,
+    GenerateOk,
     Error,
 }
 
@@ -20,6 +22,8 @@ impl Display for Type {
             Type::InitOk => "init_ok",
             Type::Echo => "echo",
             Type::EchoOk => "echo_ok",
+            Type::Generate => "generate",
+            Type::GenerateOk => "generate_ok",
             Type::Error => "error",
         };
         f.write_str(str)
@@ -34,6 +38,8 @@ impl Type {
             "echo" => Type::Echo,
             "echo_ok" => Type::EchoOk,
             "error" => Type::Error,
+            "generate" => Type::Generate,
+            "generate_ok" => Type::GenerateOk,
             s => bail!("received unknown type {:?}", s),
         };
         Ok(type_)
@@ -72,15 +78,11 @@ impl Message {
         let type_ = body["type"]
             .as_str()
             .ok_or_else(|| anyhow!("type field not found"))?;
-        let type_ = match type_ {
-            "init" => Type::Init,
-            "echo" => Type::Echo,
-            other => bail!("unknown type: {other}"),
-        };
+        let type_ = Type::of_string(type_)?;
 
         let data: HashMap<String, String> = body
             .iter()
-            .filter(|(k, _)| !matches!(k.as_str(), "type" | "message_id" | "in_reply_to"))
+            .filter(|(k, _)| !matches!(k.as_str(), "type" | "msg_id" | "in_reply_to"))
             .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
             .collect();
 
