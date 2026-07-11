@@ -1,8 +1,9 @@
 mod message;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Result, anyhow, bail};
+use futures::future::try_join_all;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
@@ -11,16 +12,22 @@ use crate::message::Message;
 #[derive(Debug)]
 struct Node {
     node_id: String,
+    node_ids: Vec<String>,
+    neighbors: Vec<String>,
     message_id: u64,
     generate_counter: u64,
+    broadcasted_values: HashSet<u64>,
 }
 
 impl Node {
-    fn create(node_id: String) -> Self {
+    fn create(node_id: String, node_ids: Vec<String>) -> Self {
         Node {
             node_id,
+            node_ids,
+            neighbors: Vec::new(),
             message_id: 1,
             generate_counter: 0,
+            broadcasted_values: HashSet::new(),
         }
     }
 
@@ -50,11 +57,30 @@ async fn run() -> Result<()> {
     let stdout_handle = tokio::spawn(write_stdout_task(output_rx));
     let node_handle = tokio::spawn(run_node(input_rx, output_tx));
 
-    let (stdin_res, stdout_res, node_res) =
-        tokio::try_join!(stdin_handle, stdout_handle, node_handle)?;
-    stdin_res?;
-    stdout_res?;
-    node_res?;
+    let (stdin_res, stdout_res, node_res) = tokio::join!(stdin_handle, stdout_handle, node_handle);
+
+    if let Err(e) = &node_res {
+        eprintln!("node task panicked: {e:?}");
+    }
+    if let Ok(Err(e)) = &node_res {
+        eprintln!("node task returned error: {e:?}");
+    }
+    if let Err(e) = &stdin_res {
+        eprintln!("stdin task panicked: {e:?}");
+    }
+    if let Ok(Err(e)) = &stdin_res {
+        eprintln!("stdin task returned error: {e:?}");
+    }
+    if let Err(e) = &stdout_res {
+        eprintln!("stdout task panicked: {e:?}");
+    }
+    if let Ok(Err(e)) = &stdout_res {
+        eprintln!("stdout task returned error: {e:?}");
+    }
+
+    stdin_res??;
+    stdout_res??;
+    node_res??;
 
     Ok(())
 }
@@ -70,8 +96,18 @@ async fn run_node(mut rx: mpsc::Receiver<Message>, tx: mpsc::Sender<Message>) ->
                 .data
                 .get("node_id")
                 .ok_or_else(|| anyhow!("init msg didn't have node id"))?
-                .clone();
-            let mut node = Node::create(node_id);
+                .as_str()
+                .ok_or_else(|| anyhow!("could not parse node id as string"))?;
+            let node_ids = init_msg
+                .data
+                .get("node_ids")
+                .ok_or_else(|| anyhow!("init msg didn't have node ids"))?
+                .as_array()
+                .ok_or_else(|| anyhow!("could not parse node ids as array"))?
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
+            let mut node = Node::create(node_id.to_string(), node_ids);
             let reply = init_msg.build_reply(
                 node.new_message_id(),
                 message::Type::InitOk,
@@ -100,9 +136,122 @@ async fn run_node(mut rx: mpsc::Receiver<Message>, tx: mpsc::Sender<Message>) ->
                 let reply = msg.build_reply(
                     node.new_message_id(),
                     message::Type::GenerateOk,
-                    HashMap::from([("id".to_string(), id)]),
+                    HashMap::from([("id".to_string(), serde_json::Value::String(id))]),
                 )?;
                 tx.send(reply).await?;
+            }
+            message::Type::Broadcast => {
+                eprintln!("received broadcast {:?}", node.node_id);
+                let message = msg.data["message"]
+                    .as_number()
+                    .ok_or_else(|| anyhow!("broadcasted message was not a number"))?
+                    .as_u64()
+                    .ok_or_else(|| anyhow!("could not fit value as u64"))?;
+                eprintln!("received broadcast {:?} {:?}", node.node_id, message);
+                node.broadcasted_values.insert(message);
+                let reply = msg.build_reply(
+                    node.new_message_id(),
+                    message::Type::BroadcastOk,
+                    HashMap::from([]),
+                )?;
+                tx.send(reply).await?;
+                let neighbors = node.neighbors.clone();
+                let futures: Vec<_> = neighbors
+                    .iter()
+                    .map(|v| {
+                        let gossip = Message::create(
+                            node.node_id.clone(),
+                            v.clone(),
+                            node.new_message_id(),
+                            message::Type::GossipBroadcast,
+                            HashMap::from([(
+                                "message".to_string(),
+                                serde_json::Value::Number(
+                                    serde_json::Number::from_u128(u128::from(message)).unwrap(),
+                                ),
+                            )]),
+                        )
+                        .unwrap();
+                        tx.send(gossip)
+                    })
+                    .collect();
+                try_join_all(futures).await?;
+            }
+            message::Type::GossipBroadcast => {
+                eprintln!("received gossip {:?}", node.node_id);
+                let message = msg.data["message"]
+                    .as_number()
+                    .ok_or_else(|| anyhow!("broadcasted message was not a number"))?
+                    .as_u64()
+                    .ok_or_else(|| anyhow!("could not fit value as u64"))?;
+                eprintln!("received gossip {:?} {:?}", node.node_id, message);
+                let is_new = node.broadcasted_values.insert(message);
+                if is_new {
+                    let neighbors = node.neighbors.clone();
+                    let futures: Vec<_> = neighbors
+                        .iter()
+                        .filter_map(|v| {
+                            if v == &msg.src {
+                                return None;
+                            }
+
+                            let gossip = Message::create(
+                                node.node_id.clone(),
+                                v.clone(),
+                                node.new_message_id(),
+                                message::Type::GossipBroadcast,
+                                HashMap::from([(
+                                    "message".to_string(),
+                                    serde_json::Value::Number(
+                                        serde_json::Number::from_u128(u128::from(message)).unwrap(),
+                                    ),
+                                )]),
+                            )
+                            .unwrap();
+                            Some(tx.send(gossip))
+                        })
+                        .collect();
+                    try_join_all(futures).await?;
+                }
+            }
+            message::Type::Read => {
+                let resp_vec = node
+                    .broadcasted_values
+                    .iter()
+                    .map(|v| {
+                        serde_json::Value::Number(
+                            serde_json::Number::from_u128(u128::from(*v)).unwrap(),
+                        )
+                    })
+                    .collect();
+                let reply = msg.build_reply(
+                    node.new_message_id(),
+                    message::Type::ReadOk,
+                    HashMap::from([("messages".to_string(), serde_json::Value::Array(resp_vec))]),
+                )?;
+                tx.send(reply).await?;
+            }
+            message::Type::Topology => {
+                let reply = msg.build_reply(
+                    node.new_message_id(),
+                    message::Type::TopologyOk,
+                    HashMap::from([]),
+                )?;
+                tx.send(reply).await?;
+                let neighbors = msg
+                    .data
+                    .get("topology")
+                    .ok_or_else(|| anyhow!("topology msg didn't have topology"))?
+                    .as_object()
+                    .ok_or_else(|| anyhow!("could not parse topology as map"))?
+                    .get(&node.node_id)
+                    .ok_or_else(|| anyhow!("did not find node in topology"))?
+                    .as_array()
+                    .ok_or_else(|| anyhow!("could not parse node ids as array"))?
+                    .iter()
+                    .map(|v| v.as_str().unwrap().to_string())
+                    .collect();
+                node.neighbors = neighbors;
             }
             other => bail!("received unimplemented message {:?}", other),
         }

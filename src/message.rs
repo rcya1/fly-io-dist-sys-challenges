@@ -12,6 +12,13 @@ pub enum Type {
     EchoOk,
     Generate,
     GenerateOk,
+    Broadcast,
+    BroadcastOk,
+    GossipBroadcast,
+    Read,
+    ReadOk,
+    Topology,
+    TopologyOk,
     Error,
 }
 
@@ -24,6 +31,13 @@ impl Display for Type {
             Type::EchoOk => "echo_ok",
             Type::Generate => "generate",
             Type::GenerateOk => "generate_ok",
+            Type::Broadcast => "broadcast",
+            Type::BroadcastOk => "broadcast_ok",
+            Type::GossipBroadcast => "gossip_broadcast",
+            Type::Read => "read",
+            Type::ReadOk => "read_ok",
+            Type::Topology => "topology",
+            Type::TopologyOk => "topology_ok",
             Type::Error => "error",
         };
         f.write_str(str)
@@ -40,6 +54,13 @@ impl Type {
             "error" => Type::Error,
             "generate" => Type::Generate,
             "generate_ok" => Type::GenerateOk,
+            "broadcast" => Type::Broadcast,
+            "broadcast_ok" => Type::BroadcastOk,
+            "gossip_broadcast" => Type::GossipBroadcast,
+            "read" => Type::Read,
+            "read_ok" => Type::ReadOk,
+            "topology" => Type::Topology,
+            "topology_ok" => Type::TopologyOk,
             s => bail!("received unknown type {:?}", s),
         };
         Ok(type_)
@@ -48,12 +69,12 @@ impl Type {
 
 #[derive(Debug)]
 pub struct Message {
-    src: String,
+    pub src: String,
     dest: String,
     message_id: Option<u64>,
     in_reply_to: Option<u64>,
     pub type_: Type,
-    pub data: HashMap<String, String>,
+    pub data: HashMap<String, serde_json::Value>,
 }
 
 impl Message {
@@ -80,10 +101,10 @@ impl Message {
             .ok_or_else(|| anyhow!("type field not found"))?;
         let type_ = Type::of_string(type_)?;
 
-        let data: HashMap<String, String> = body
+        let data: HashMap<String, serde_json::Value> = body
             .iter()
             .filter(|(k, _)| !matches!(k.as_str(), "type" | "msg_id" | "in_reply_to"))
-            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+            .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 
         Ok(Message {
@@ -96,11 +117,28 @@ impl Message {
         })
     }
 
+    pub fn create(
+        src: String,
+        dest: String,
+        message_id: u64,
+        type_: Type,
+        data: HashMap<String, serde_json::Value>,
+    ) -> Result<Message> {
+        Ok(Message {
+            src,
+            dest,
+            message_id: Some(message_id),
+            in_reply_to: None,
+            type_,
+            data,
+        })
+    }
+
     pub fn build_reply(
         &self,
         message_id: u64,
         type_: Type,
-        data: HashMap<String, String>,
+        data: HashMap<String, serde_json::Value>,
     ) -> Result<Message> {
         let in_reply_to = self
             .message_id
@@ -132,7 +170,7 @@ impl Display for Message {
             body.insert("in_reply_to".into(), Value::Number(in_reply_to.into()));
         }
         self.data.iter().for_each(|(key, value)| {
-            body.insert(key.clone(), Value::String(value.to_string()));
+            body.insert(key.clone(), value.clone());
         });
         map.insert("body".into(), Value::Object(body));
 
