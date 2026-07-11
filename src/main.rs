@@ -1,6 +1,6 @@
 mod message;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use anyhow::{Result, anyhow, bail};
 use futures::future::try_join_all;
@@ -84,6 +84,136 @@ async fn run() -> Result<()> {
 
     Ok(())
 }
+
+async fn handle_echo(
+    node: &mut Node,
+    tx: mpsc::Sender<Message>,
+    msg: message::Message,
+) -> Result<()> {
+    let echo_msg = msg.data["echo"].clone();
+    let reply = msg.build_reply(
+        node.new_message_id(),
+        message::Type::EchoOk,
+        vec![("echo".to_string(), echo_msg)],
+    )?;
+    tx.send(reply).await?;
+    Ok(())
+}
+
+async fn handle_generate(
+    node: &mut Node,
+    tx: mpsc::Sender<Message>,
+    msg: message::Message,
+) -> Result<()> {
+    node.generate_counter += 1;
+    let id = format!("{}-{}", node.node_id, node.generate_counter);
+    let reply = msg.build_reply(
+        node.new_message_id(),
+        message::Type::GenerateOk,
+        vec![("id".to_string(), serde_json::Value::String(id))],
+    )?;
+    tx.send(reply).await?;
+    Ok(())
+}
+
+async fn propagate_gossip(
+    node: &mut Node,
+    tx: mpsc::Sender<Message>,
+    msg: u64,
+    exclude_id: Option<String>,
+) -> Result<()> {
+    let mut futures = Vec::with_capacity(node.neighbors.len());
+    for i in 0..node.neighbors.len() {
+        if let Some(ref exclude_id) = exclude_id
+            && exclude_id == &node.neighbors[i]
+        {
+            continue;
+        }
+        let gossip = Message::create(
+            node.node_id.clone(),
+            node.neighbors[i].clone(),
+            node.new_message_id(),
+            message::Type::GossipBroadcast,
+            vec![("message".to_string(), message::Message::serde_num(msg))],
+        )
+        .unwrap();
+        futures.push(tx.send(gossip));
+    }
+    try_join_all(futures).await?;
+    Ok(())
+}
+
+async fn handle_broadcast(
+    node: &mut Node,
+    tx: mpsc::Sender<Message>,
+    msg: message::Message,
+) -> Result<()> {
+    let message = msg.get_u64("message")?;
+    node.broadcasted_values.insert(message);
+
+    let reply = msg.build_reply(node.new_message_id(), message::Type::BroadcastOk, vec![])?;
+    tx.send(reply).await?;
+
+    propagate_gossip(node, tx.clone(), message, None).await?;
+    Ok(())
+}
+
+async fn handle_gossip_broadcast(
+    node: &mut Node,
+    tx: mpsc::Sender<Message>,
+    msg: message::Message,
+) -> Result<()> {
+    let message = msg.get_u64("message")?;
+    let is_new = node.broadcasted_values.insert(message);
+    if is_new {
+        propagate_gossip(node, tx.clone(), message, Some(node.node_id.clone())).await?;
+    }
+    Ok(())
+}
+
+async fn handle_read(
+    node: &mut Node,
+    tx: mpsc::Sender<Message>,
+    msg: message::Message,
+) -> Result<()> {
+    let resp_vec = node
+        .broadcasted_values
+        .iter()
+        .map(|v| serde_json::Value::Number(serde_json::Number::from_u128(u128::from(*v)).unwrap()))
+        .collect();
+    let reply = msg.build_reply(
+        node.new_message_id(),
+        message::Type::ReadOk,
+        vec![("messages".to_string(), serde_json::Value::Array(resp_vec))],
+    )?;
+    tx.send(reply).await?;
+    Ok(())
+}
+
+async fn handle_topology(
+    node: &mut Node,
+    tx: mpsc::Sender<Message>,
+    msg: message::Message,
+) -> Result<()> {
+    let reply = msg.build_reply(node.new_message_id(), message::Type::TopologyOk, vec![])?;
+    tx.send(reply).await?;
+    let neighbors = msg
+        .data
+        .get("topology")
+        .ok_or_else(|| anyhow!("topology msg didn't have topology"))?
+        .as_object()
+        .ok_or_else(|| anyhow!("could not parse topology as map"))?
+        .get(&node.node_id)
+        .ok_or_else(|| anyhow!("did not find node in topology"))?
+        .as_array()
+        .ok_or_else(|| anyhow!("could not parse node ids as array"))?
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    node.neighbors = neighbors;
+    Ok(())
+}
+
 async fn run_node(mut rx: mpsc::Receiver<Message>, tx: mpsc::Sender<Message>) -> Result<()> {
     let init_msg = rx
         .recv()
@@ -92,27 +222,11 @@ async fn run_node(mut rx: mpsc::Receiver<Message>, tx: mpsc::Sender<Message>) ->
 
     let mut node = match init_msg.type_ {
         message::Type::Init => {
-            let node_id = init_msg
-                .data
-                .get("node_id")
-                .ok_or_else(|| anyhow!("init msg didn't have node id"))?
-                .as_str()
-                .ok_or_else(|| anyhow!("could not parse node id as string"))?;
-            let node_ids = init_msg
-                .data
-                .get("node_ids")
-                .ok_or_else(|| anyhow!("init msg didn't have node ids"))?
-                .as_array()
-                .ok_or_else(|| anyhow!("could not parse node ids as array"))?
-                .iter()
-                .map(|v| v.as_str().unwrap().to_string())
-                .collect();
+            let node_id = init_msg.get_string("node_id")?;
+            let node_ids = init_msg.get_string_array("node_ids")?;
             let mut node = Node::create(node_id.to_string(), node_ids);
-            let reply = init_msg.build_reply(
-                node.new_message_id(),
-                message::Type::InitOk,
-                HashMap::new(),
-            )?;
+            let reply =
+                init_msg.build_reply(node.new_message_id(), message::Type::InitOk, vec![])?;
             tx.send(reply).await?;
             node
         }
@@ -122,137 +236,21 @@ async fn run_node(mut rx: mpsc::Receiver<Message>, tx: mpsc::Sender<Message>) ->
     while let Some(msg) = rx.recv().await {
         match msg.type_ {
             message::Type::Echo => {
-                let echo_msg = msg.data["echo"].clone();
-                let reply = msg.build_reply(
-                    node.new_message_id(),
-                    message::Type::EchoOk,
-                    HashMap::from([("echo".to_string(), echo_msg)]),
-                )?;
-                tx.send(reply).await?;
+                handle_echo(&mut node, tx.clone(), msg).await?;
             }
             message::Type::Generate => {
-                let id = format!("{}-{}", node.node_id, node.generate_counter);
-                node.generate_counter += 1;
-                let reply = msg.build_reply(
-                    node.new_message_id(),
-                    message::Type::GenerateOk,
-                    HashMap::from([("id".to_string(), serde_json::Value::String(id))]),
-                )?;
-                tx.send(reply).await?;
+                handle_generate(&mut node, tx.clone(), msg).await?;
             }
             message::Type::Broadcast => {
-                eprintln!("received broadcast {:?}", node.node_id);
-                let message = msg.data["message"]
-                    .as_number()
-                    .ok_or_else(|| anyhow!("broadcasted message was not a number"))?
-                    .as_u64()
-                    .ok_or_else(|| anyhow!("could not fit value as u64"))?;
-                eprintln!("received broadcast {:?} {:?}", node.node_id, message);
-                node.broadcasted_values.insert(message);
-                let reply = msg.build_reply(
-                    node.new_message_id(),
-                    message::Type::BroadcastOk,
-                    HashMap::from([]),
-                )?;
-                tx.send(reply).await?;
-                let neighbors = node.neighbors.clone();
-                let futures: Vec<_> = neighbors
-                    .iter()
-                    .map(|v| {
-                        let gossip = Message::create(
-                            node.node_id.clone(),
-                            v.clone(),
-                            node.new_message_id(),
-                            message::Type::GossipBroadcast,
-                            HashMap::from([(
-                                "message".to_string(),
-                                serde_json::Value::Number(
-                                    serde_json::Number::from_u128(u128::from(message)).unwrap(),
-                                ),
-                            )]),
-                        )
-                        .unwrap();
-                        tx.send(gossip)
-                    })
-                    .collect();
-                try_join_all(futures).await?;
+                handle_broadcast(&mut node, tx.clone(), msg).await?;
             }
             message::Type::GossipBroadcast => {
-                eprintln!("received gossip {:?}", node.node_id);
-                let message = msg.data["message"]
-                    .as_number()
-                    .ok_or_else(|| anyhow!("broadcasted message was not a number"))?
-                    .as_u64()
-                    .ok_or_else(|| anyhow!("could not fit value as u64"))?;
-                eprintln!("received gossip {:?} {:?}", node.node_id, message);
-                let is_new = node.broadcasted_values.insert(message);
-                if is_new {
-                    let neighbors = node.neighbors.clone();
-                    let futures: Vec<_> = neighbors
-                        .iter()
-                        .filter_map(|v| {
-                            if v == &msg.src {
-                                return None;
-                            }
-
-                            let gossip = Message::create(
-                                node.node_id.clone(),
-                                v.clone(),
-                                node.new_message_id(),
-                                message::Type::GossipBroadcast,
-                                HashMap::from([(
-                                    "message".to_string(),
-                                    serde_json::Value::Number(
-                                        serde_json::Number::from_u128(u128::from(message)).unwrap(),
-                                    ),
-                                )]),
-                            )
-                            .unwrap();
-                            Some(tx.send(gossip))
-                        })
-                        .collect();
-                    try_join_all(futures).await?;
-                }
+                handle_gossip_broadcast(&mut node, tx.clone(), msg).await?;
             }
             message::Type::Read => {
-                let resp_vec = node
-                    .broadcasted_values
-                    .iter()
-                    .map(|v| {
-                        serde_json::Value::Number(
-                            serde_json::Number::from_u128(u128::from(*v)).unwrap(),
-                        )
-                    })
-                    .collect();
-                let reply = msg.build_reply(
-                    node.new_message_id(),
-                    message::Type::ReadOk,
-                    HashMap::from([("messages".to_string(), serde_json::Value::Array(resp_vec))]),
-                )?;
-                tx.send(reply).await?;
+                handle_read(&mut node, tx.clone(), msg).await?;
             }
-            message::Type::Topology => {
-                let reply = msg.build_reply(
-                    node.new_message_id(),
-                    message::Type::TopologyOk,
-                    HashMap::from([]),
-                )?;
-                tx.send(reply).await?;
-                let neighbors = msg
-                    .data
-                    .get("topology")
-                    .ok_or_else(|| anyhow!("topology msg didn't have topology"))?
-                    .as_object()
-                    .ok_or_else(|| anyhow!("could not parse topology as map"))?
-                    .get(&node.node_id)
-                    .ok_or_else(|| anyhow!("did not find node in topology"))?
-                    .as_array()
-                    .ok_or_else(|| anyhow!("could not parse node ids as array"))?
-                    .iter()
-                    .map(|v| v.as_str().unwrap().to_string())
-                    .collect();
-                node.neighbors = neighbors;
-            }
+            message::Type::Topology => handle_topology(&mut node, tx.clone(), msg).await?,
             other => bail!("received unimplemented message {:?}", other),
         }
     }

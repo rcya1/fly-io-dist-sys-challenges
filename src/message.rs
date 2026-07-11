@@ -122,7 +122,7 @@ impl Message {
         dest: String,
         message_id: u64,
         type_: Type,
-        data: HashMap<String, serde_json::Value>,
+        data: Vec<(String, serde_json::Value)>,
     ) -> Result<Message> {
         Ok(Message {
             src,
@@ -130,7 +130,7 @@ impl Message {
             message_id: Some(message_id),
             in_reply_to: None,
             type_,
-            data,
+            data: HashMap::from_iter(data),
         })
     }
 
@@ -138,7 +138,7 @@ impl Message {
         &self,
         message_id: u64,
         type_: Type,
-        data: HashMap<String, serde_json::Value>,
+        data: Vec<(String, serde_json::Value)>,
     ) -> Result<Message> {
         let in_reply_to = self
             .message_id
@@ -149,8 +149,50 @@ impl Message {
             message_id: Some(message_id),
             in_reply_to: Some(in_reply_to),
             type_,
-            data,
+            data: HashMap::from_iter(data),
         })
+    }
+
+    pub fn get_string(&self, key: &str) -> Result<String> {
+        let value = self
+            .data
+            .get(key)
+            .ok_or_else(|| anyhow!("init msg didn't have key {:?}", key))?
+            .as_str()
+            .ok_or_else(|| anyhow!("could not parse {:?} as string", key))?
+            .to_string();
+        Ok(value)
+    }
+
+    pub fn get_u64(&self, key: &str) -> Result<u64> {
+        let value = self
+            .data
+            .get(key)
+            .ok_or_else(|| anyhow!("init msg didn't have key {:?}", key))?
+            .as_u64()
+            .ok_or_else(|| anyhow!("could not parse {:?} as u64", key))?;
+        Ok(value)
+    }
+
+    pub fn get_string_array(&self, key: &str) -> Result<Vec<String>> {
+        let value = self
+            .data
+            .get(key)
+            .ok_or_else(|| anyhow!("init msg didn't have key {:?}", key))?
+            .as_array()
+            .ok_or_else(|| anyhow!("could not parse {:?} as array", key))?
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| anyhow!("array element {:?} is not a string", v))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(value)
+    }
+
+    pub fn serde_num(num: u64) -> serde_json::Value {
+        serde_json::Value::Number(serde_json::Number::from_u128(u128::from(num)).unwrap())
     }
 }
 
