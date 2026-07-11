@@ -1,13 +1,18 @@
 mod message;
+mod serde_ext;
 
 use std::collections::HashSet;
 
 use anyhow::{Result, anyhow, bail};
 use futures::future::try_join_all;
+use serde_ext::{SerdeJsonExt, SerdeMapExt};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
 use crate::message::Message;
+
+// TODO: make the gossip smarter so we only do a bfs, we know which ones were already sent to so we minimize as much as possible
+// TODO: Should go through all String vs &str
 
 #[derive(Debug)]
 struct Node {
@@ -58,25 +63,18 @@ async fn run() -> Result<()> {
     let node_handle = tokio::spawn(run_node(input_rx, output_tx));
 
     let (stdin_res, stdout_res, node_res) = tokio::join!(stdin_handle, stdout_handle, node_handle);
+    fn process_res(res: &Result<Result<()>, tokio::task::JoinError>, tag: &str) {
+        if let Err(e) = &res {
+            eprintln!("{tag} task panicked: {e:?}");
+        }
+        if let Ok(Err(e)) = &res {
+            eprintln!("{tag} task returned error: {e:?}");
+        }
+    }
 
-    if let Err(e) = &node_res {
-        eprintln!("node task panicked: {e:?}");
-    }
-    if let Ok(Err(e)) = &node_res {
-        eprintln!("node task returned error: {e:?}");
-    }
-    if let Err(e) = &stdin_res {
-        eprintln!("stdin task panicked: {e:?}");
-    }
-    if let Ok(Err(e)) = &stdin_res {
-        eprintln!("stdin task returned error: {e:?}");
-    }
-    if let Err(e) = &stdout_res {
-        eprintln!("stdout task panicked: {e:?}");
-    }
-    if let Ok(Err(e)) = &stdout_res {
-        eprintln!("stdout task returned error: {e:?}");
-    }
+    process_res(&node_res, "node");
+    process_res(&stdin_res, "stdin");
+    process_res(&stdout_res, "stdout");
 
     stdin_res??;
     stdout_res??;
@@ -134,7 +132,7 @@ async fn propagate_gossip(
             node.neighbors[i].clone(),
             node.new_message_id(),
             message::Type::GossipBroadcast,
-            vec![("message".to_string(), message::Message::serde_num(msg))],
+            vec![("message".to_string(), serde_json::Value::from(msg))],
         )
         .unwrap();
         futures.push(tx.send(gossip));
@@ -148,7 +146,7 @@ async fn handle_broadcast(
     tx: mpsc::Sender<Message>,
     msg: message::Message,
 ) -> Result<()> {
-    let message = msg.get_u64("message")?;
+    let message = msg.get("message")?.as_num()?;
     node.broadcasted_values.insert(message);
 
     let reply = msg.build_reply(node.new_message_id(), message::Type::BroadcastOk, vec![])?;
@@ -163,7 +161,7 @@ async fn handle_gossip_broadcast(
     tx: mpsc::Sender<Message>,
     msg: message::Message,
 ) -> Result<()> {
-    let message = msg.get_u64("message")?;
+    let message = msg.get("message")?.as_num()?;
     let is_new = node.broadcasted_values.insert(message);
     if is_new {
         propagate_gossip(node, tx.clone(), message, Some(node.node_id.clone())).await?;
@@ -179,7 +177,7 @@ async fn handle_read(
     let resp_vec = node
         .broadcasted_values
         .iter()
-        .map(|v| serde_json::Value::Number(serde_json::Number::from_u128(u128::from(*v)).unwrap()))
+        .map(|v| serde_json::Value::from(*v))
         .collect();
     let reply = msg.build_reply(
         node.new_message_id(),
@@ -198,18 +196,10 @@ async fn handle_topology(
     let reply = msg.build_reply(node.new_message_id(), message::Type::TopologyOk, vec![])?;
     tx.send(reply).await?;
     let neighbors = msg
-        .data
-        .get("topology")
-        .ok_or_else(|| anyhow!("topology msg didn't have topology"))?
-        .as_object()
-        .ok_or_else(|| anyhow!("could not parse topology as map"))?
-        .get(&node.node_id)
-        .ok_or_else(|| anyhow!("did not find node in topology"))?
-        .as_array()
-        .ok_or_else(|| anyhow!("could not parse node ids as array"))?
-        .iter()
-        .map(|v| v.as_str().unwrap().to_string())
-        .collect();
+        .get("topology")?
+        .as_obj()?
+        .get_key(&node.node_id)?
+        .as_string_array()?;
     node.neighbors = neighbors;
     Ok(())
 }
@@ -222,8 +212,8 @@ async fn run_node(mut rx: mpsc::Receiver<Message>, tx: mpsc::Sender<Message>) ->
 
     let mut node = match init_msg.type_ {
         message::Type::Init => {
-            let node_id = init_msg.get_string("node_id")?;
-            let node_ids = init_msg.get_string_array("node_ids")?;
+            let node_id = init_msg.get("node_id")?.as_string()?;
+            let node_ids = init_msg.get("node_ids")?.as_string_array()?;
             let mut node = Node::create(node_id.to_string(), node_ids);
             let reply =
                 init_msg.build_reply(node.new_message_id(), message::Type::InitOk, vec![])?;
