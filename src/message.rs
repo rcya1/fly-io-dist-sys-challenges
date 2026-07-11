@@ -1,7 +1,9 @@
 use anyhow::{Result, anyhow, bail};
+use serde::ser::{Serialize, SerializeMap, Serializer};
 use std::{
     collections::HashMap,
     fmt::{self, Display},
+    sync::Arc,
 };
 
 #[derive(Debug)]
@@ -24,7 +26,19 @@ pub enum Type {
 
 impl Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let str = match self {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for Type {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl Type {
+    fn as_str(&self) -> &'static str {
+        match self {
             Type::Init => "init",
             Type::InitOk => "init_ok",
             Type::Echo => "echo",
@@ -39,12 +53,9 @@ impl Display for Type {
             Type::Topology => "topology",
             Type::TopologyOk => "topology_ok",
             Type::Error => "error",
-        };
-        f.write_str(str)
+        }
     }
-}
 
-impl Type {
     fn of_string(str: &str) -> Result<Self> {
         let type_ = match str {
             "init" => Type::Init,
@@ -69,8 +80,8 @@ impl Type {
 
 #[derive(Debug)]
 pub struct Message {
-    pub src: String,
-    dest: String,
+    pub src: Arc<str>,
+    pub dest: Arc<str>,
     message_id: Option<u64>,
     in_reply_to: Option<u64>,
     pub type_: Type,
@@ -79,33 +90,34 @@ pub struct Message {
 
 impl Message {
     pub fn parse(input: &str) -> Result<Message> {
-        let json: serde_json::Value = serde_json::from_str(input)?;
-        let src = json["src"]
-            .as_str()
-            .ok_or_else(|| anyhow!("src field not found"))?
-            .to_string();
-        let dest = json["dest"]
-            .as_str()
-            .ok_or_else(|| anyhow!("dest field not found"))?
-            .to_string();
+        let mut json: serde_json::Value = serde_json::from_str(input)?;
+        let obj = json
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("message is not an object"))?;
 
-        let body = json["body"]
-            .as_object()
-            .ok_or_else(|| anyhow!("body field not found"))?;
+        let src: Arc<str> = match obj.remove("src") {
+            Some(serde_json::Value::String(s)) => Arc::from(s),
+            _ => bail!("src field not found"),
+        };
+        let dest: Arc<str> = match obj.remove("dest") {
+            Some(serde_json::Value::String(s)) => Arc::from(s),
+            _ => bail!("dest field not found"),
+        };
 
-        let message_id = body.get("msg_id").and_then(|v| v.as_u64());
-        let in_reply_to = body.get("in_reply_to").and_then(|v| v.as_u64());
+        let mut body = match obj.remove("body") {
+            Some(serde_json::Value::Object(m)) => m,
+            _ => bail!("body field not found"),
+        };
 
-        let type_ = body["type"]
-            .as_str()
-            .ok_or_else(|| anyhow!("type field not found"))?;
-        let type_ = Type::of_string(type_)?;
+        let message_id = body.remove("msg_id").and_then(|v| v.as_u64());
+        let in_reply_to = body.remove("in_reply_to").and_then(|v| v.as_u64());
 
-        let data: HashMap<String, serde_json::Value> = body
-            .iter()
-            .filter(|(k, _)| !matches!(k.as_str(), "type" | "msg_id" | "in_reply_to"))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        let type_ = match body.remove("type") {
+            Some(serde_json::Value::String(s)) => Type::of_string(&s)?,
+            _ => bail!("type field not found"),
+        };
+
+        let data: HashMap<String, serde_json::Value> = body.into_iter().collect();
 
         Ok(Message {
             src,
@@ -118,11 +130,11 @@ impl Message {
     }
 
     pub fn create(
-        src: String,
-        dest: String,
+        src: Arc<str>,
+        dest: Arc<str>,
         message_id: u64,
         type_: Type,
-        data: Vec<(String, serde_json::Value)>,
+        data: Vec<(&str, serde_json::Value)>,
     ) -> Result<Message> {
         Ok(Message {
             src,
@@ -130,7 +142,7 @@ impl Message {
             message_id: Some(message_id),
             in_reply_to: None,
             type_,
-            data: HashMap::from_iter(data),
+            data: data.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
         })
     }
 
@@ -138,7 +150,7 @@ impl Message {
         &self,
         message_id: u64,
         type_: Type,
-        data: Vec<(String, serde_json::Value)>,
+        data: Vec<(&str, serde_json::Value)>,
     ) -> Result<Message> {
         let in_reply_to = self
             .message_id
@@ -149,41 +161,45 @@ impl Message {
             message_id: Some(message_id),
             in_reply_to: Some(in_reply_to),
             type_,
-            data: HashMap::from_iter(data),
+            data: data.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
         })
     }
 
-    pub fn get(&self, key: &str) -> Result<serde_json::Value> {
+    pub fn get(&self, key: &str) -> Result<&serde_json::Value> {
         let value = self
             .data
             .get(key)
-            .ok_or_else(|| anyhow!("did not find key {:?}", key))?
-            .clone();
+            .ok_or_else(|| anyhow!("did not find key {:?}", key))?;
         Ok(value)
     }
 }
 
-impl Display for Message {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use serde_json::*;
-        let mut map = Map::new();
-        map.insert("src".into(), Value::String(self.src.clone()));
-        map.insert("dest".into(), Value::String(self.dest.clone()));
+impl Serialize for Message {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(3))?;
+        map.serialize_entry("src", self.src.as_ref())?;
+        map.serialize_entry("dest", self.dest.as_ref())?;
+        map.serialize_entry("body", &MessageBody(self))?;
+        map.end()
+    }
+}
 
-        let mut body = Map::new();
-        body.insert("type".into(), Value::String(self.type_.to_string()));
-        if let Some(message_id) = self.message_id {
-            body.insert("msg_id".into(), Value::Number(message_id.into()));
-        }
-        if let Some(in_reply_to) = self.in_reply_to {
-            body.insert("in_reply_to".into(), Value::Number(in_reply_to.into()));
-        }
-        self.data.iter().for_each(|(key, value)| {
-            body.insert(key.clone(), value.clone());
-        });
-        map.insert("body".into(), Value::Object(body));
+struct MessageBody<'a>(&'a Message);
 
-        let str = Value::to_string(&Value::Object(map));
-        f.write_str(&str)
+impl<'a> Serialize for MessageBody<'a> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let msg = self.0;
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("type", &msg.type_)?;
+        if let Some(message_id) = msg.message_id {
+            map.serialize_entry("msg_id", &message_id)?;
+        }
+        if let Some(in_reply_to) = msg.in_reply_to {
+            map.serialize_entry("in_reply_to", &in_reply_to)?;
+        }
+        for (key, value) in &msg.data {
+            map.serialize_entry(key, value)?;
+        }
+        map.end()
     }
 }

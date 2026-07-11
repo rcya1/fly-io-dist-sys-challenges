@@ -1,7 +1,7 @@
 mod message;
 mod serde_ext;
 
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 use anyhow::{Result, anyhow, bail};
 use futures::future::try_join_all;
@@ -12,20 +12,19 @@ use tokio::sync::mpsc;
 use crate::message::Message;
 
 // TODO: make the gossip smarter so we only do a bfs, we know which ones were already sent to so we minimize as much as possible
-// TODO: Should go through all String vs &str
 
 #[derive(Debug)]
 struct Node {
-    node_id: String,
+    node_id: Arc<str>,
     node_ids: Vec<String>,
-    neighbors: Vec<String>,
+    neighbors: Vec<Arc<str>>,
     message_id: u64,
     generate_counter: u64,
     broadcasted_values: HashSet<u64>,
 }
 
 impl Node {
-    fn create(node_id: String, node_ids: Vec<String>) -> Self {
+    fn create(node_id: Arc<str>, node_ids: Vec<String>) -> Self {
         Node {
             node_id,
             node_ids,
@@ -92,7 +91,7 @@ async fn handle_echo(
     let reply = msg.build_reply(
         node.new_message_id(),
         message::Type::EchoOk,
-        vec![("echo".to_string(), echo_msg)],
+        vec![("echo", echo_msg)],
     )?;
     tx.send(reply).await?;
     Ok(())
@@ -108,7 +107,7 @@ async fn handle_generate(
     let reply = msg.build_reply(
         node.new_message_id(),
         message::Type::GenerateOk,
-        vec![("id".to_string(), serde_json::Value::String(id))],
+        vec![("id", serde_json::Value::String(id))],
     )?;
     tx.send(reply).await?;
     Ok(())
@@ -118,21 +117,22 @@ async fn propagate_gossip(
     node: &mut Node,
     tx: mpsc::Sender<Message>,
     msg: u64,
-    exclude_id: Option<String>,
+    exclude_id: Option<&str>,
 ) -> Result<()> {
     let mut futures = Vec::with_capacity(node.neighbors.len());
     for i in 0..node.neighbors.len() {
-        if let Some(ref exclude_id) = exclude_id
-            && exclude_id == &node.neighbors[i]
+        if let Some(exclude_id) = exclude_id
+            && exclude_id == node.neighbors[i].as_ref()
         {
             continue;
         }
+        let message_id = node.new_message_id();
         let gossip = Message::create(
             node.node_id.clone(),
             node.neighbors[i].clone(),
-            node.new_message_id(),
+            message_id,
             message::Type::GossipBroadcast,
-            vec![("message".to_string(), serde_json::Value::from(msg))],
+            vec![("message", serde_json::Value::from(msg))],
         )
         .unwrap();
         futures.push(tx.send(gossip));
@@ -164,7 +164,7 @@ async fn handle_gossip_broadcast(
     let message = msg.get("message")?.as_num()?;
     let is_new = node.broadcasted_values.insert(message);
     if is_new {
-        propagate_gossip(node, tx.clone(), message, Some(node.node_id.clone())).await?;
+        propagate_gossip(node, tx.clone(), message, Some(&msg.src)).await?;
     }
     Ok(())
 }
@@ -182,7 +182,7 @@ async fn handle_read(
     let reply = msg.build_reply(
         node.new_message_id(),
         message::Type::ReadOk,
-        vec![("messages".to_string(), serde_json::Value::Array(resp_vec))],
+        vec![("messages", serde_json::Value::Array(resp_vec))],
     )?;
     tx.send(reply).await?;
     Ok(())
@@ -200,7 +200,7 @@ async fn handle_topology(
         .as_obj()?
         .get_key(&node.node_id)?
         .as_string_array()?;
-    node.neighbors = neighbors;
+    node.neighbors = neighbors.into_iter().map(Arc::from).collect();
     Ok(())
 }
 
@@ -213,8 +213,13 @@ async fn run_node(mut rx: mpsc::Receiver<Message>, tx: mpsc::Sender<Message>) ->
     let mut node = match init_msg.type_ {
         message::Type::Init => {
             let node_id = init_msg.get("node_id")?.as_string()?;
-            let node_ids = init_msg.get("node_ids")?.as_string_array()?;
-            let mut node = Node::create(node_id.to_string(), node_ids);
+            let node_ids = init_msg
+                .get("node_ids")?
+                .as_string_array()?
+                .iter()
+                .map(|v| v.to_string())
+                .collect();
+            let mut node = Node::create(Arc::from(node_id), node_ids);
             let reply =
                 init_msg.build_reply(node.new_message_id(), message::Type::InitOk, vec![])?;
             tx.send(reply).await?;
@@ -266,7 +271,7 @@ async fn read_stdin_task(tx: mpsc::Sender<Message>) -> Result<()> {
 async fn write_stdout_task(mut rx: mpsc::Receiver<Message>) -> Result<()> {
     let mut stdout = tokio::io::stdout();
     while let Some(msg) = rx.recv().await {
-        let msg_str = msg.to_string();
+        let msg_str = serde_json::to_string(&msg)?;
         stdout.write_all(msg_str.as_bytes()).await?;
         stdout.write_all(b"\n").await?;
         stdout.flush().await?;
