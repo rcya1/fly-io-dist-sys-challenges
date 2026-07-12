@@ -14,6 +14,16 @@ use tokio::sync::mpsc;
 
 use crate::message::Message;
 
+const GOSSIP_RESEND_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_millis(50);
+
+#[derive(Debug)]
+struct UnackedGossip {
+    dest: Arc<str>,
+    origin: Arc<str>,
+    message: u64,
+    last_send_time: tokio::time::Instant,
+}
+
 #[derive(Debug)]
 struct Node {
     node_id: Arc<str>,
@@ -22,6 +32,7 @@ struct Node {
     message_id: u64,
     generate_counter: u64,
     broadcasted_values: HashSet<u64>,
+    unacked_gossips: HashMap<u64, UnackedGossip>,
 }
 
 impl Node {
@@ -33,6 +44,7 @@ impl Node {
             message_id: 1,
             generate_counter: 0,
             broadcasted_values: HashSet::new(),
+            unacked_gossips: HashMap::new(),
         }
     }
 
@@ -139,9 +151,8 @@ async fn handle_generate(
     Ok(())
 }
 
-/// Forwards `msg` only to neighbors strictly farther (in hop count) from `origin`
-/// than this node is, so gossip flows outward from the origin instead of flooding
-/// every edge in both directions.
+// Forwards `msg` only to neighbors strictly farther (in hop count) from `origin`
+// than this node is so gossip flows outward from the origin
 async fn propagate_gossip(
     node: &mut Node,
     tx: mpsc::Sender<Message>,
@@ -150,7 +161,6 @@ async fn propagate_gossip(
 ) -> Result<()> {
     let distances = bfs_distances(&node.topology, origin);
     let Some(&my_dist) = distances.get(node.node_id.as_ref()) else {
-        // Topology doesn't (yet) know how to reach us from this origin; nothing to do.
         return Ok(());
     };
 
@@ -179,7 +189,14 @@ async fn propagate_gossip(
                 ("origin", serde_json::Value::String(origin.to_string())),
             ],
         )
-        .unwrap();
+        .unwrap(); // TODO get rid of this
+        let unacked_gossip = UnackedGossip {
+            dest: neighbor.clone(),
+            origin: Arc::from(origin),
+            message: msg,
+            last_send_time: tokio::time::Instant::now(),
+        };
+        node.unacked_gossips.insert(message_id, unacked_gossip);
         futures.push(tx.send(gossip));
     }
     try_join_all(futures).await?;
@@ -213,6 +230,51 @@ async fn handle_gossip_broadcast(
     if is_new {
         propagate_gossip(node, tx.clone(), message, origin).await?;
     }
+    let message_id = node.new_message_id();
+    let reply = msg.build_reply(message_id, message::Type::GossipBroadcastOk, vec![])?;
+    tx.send(reply).await?;
+    Ok(())
+}
+
+async fn handle_gossip_broadcast_ok(node: &mut Node, msg: message::Message) -> Result<()> {
+    let in_reply_to = msg
+        .in_reply_to
+        .ok_or_else(|| anyhow!("received ok without a in_reply_to {:?}", msg))?;
+    node.unacked_gossips.remove(&in_reply_to);
+    Ok(())
+}
+
+async fn retry_unacked_gossips(node: &mut Node, tx: mpsc::Sender<Message>) -> Result<()> {
+    let now = tokio::time::Instant::now();
+    let stale_ids: Vec<u64> = node
+        .unacked_gossips
+        .iter()
+        .filter(|(_, gossip)| now.duration_since(gossip.last_send_time) >= GOSSIP_RESEND_INTERVAL)
+        .map(|(&id, _)| id)
+        .collect();
+
+    let mut futures = Vec::with_capacity(stale_ids.len());
+    for id in stale_ids {
+        let Some(gossip) = node.unacked_gossips.get_mut(&id) else {
+            continue;
+        };
+        gossip.last_send_time = now;
+        let resend = Message::create(
+            node.node_id.clone(),
+            gossip.dest.clone(),
+            id,
+            message::Type::GossipBroadcast,
+            vec![
+                ("message", serde_json::Value::from(gossip.message)),
+                (
+                    "origin",
+                    serde_json::Value::String(gossip.origin.to_string()),
+                ),
+            ],
+        )?;
+        futures.push(tx.send(resend));
+    }
+    try_join_all(futures).await?;
     Ok(())
 }
 
@@ -284,25 +346,39 @@ async fn run_node(mut rx: mpsc::Receiver<Message>, tx: mpsc::Sender<Message>) ->
         other => bail!("received non-init message {:?}", other),
     };
 
-    while let Some(msg) = rx.recv().await {
-        match msg.type_ {
-            message::Type::Echo => {
-                handle_echo(&mut node, tx.clone(), msg).await?;
+    let mut retry_interval = tokio::time::interval(GOSSIP_RESEND_INTERVAL);
+    retry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            msg = rx.recv() => {
+                let Some(msg) = msg else { break };
+                match msg.type_ {
+                    message::Type::Echo => {
+                        handle_echo(&mut node, tx.clone(), msg).await?;
+                    }
+                    message::Type::Generate => {
+                        handle_generate(&mut node, tx.clone(), msg).await?;
+                    }
+                    message::Type::Broadcast => {
+                        handle_broadcast(&mut node, tx.clone(), msg).await?;
+                    }
+                    message::Type::GossipBroadcast => {
+                        handle_gossip_broadcast(&mut node, tx.clone(), msg).await?;
+                    }
+                    message::Type::GossipBroadcastOk => {
+                        handle_gossip_broadcast_ok(&mut node, msg).await?;
+                    }
+                    message::Type::Read => {
+                        handle_read(&mut node, tx.clone(), msg).await?;
+                    }
+                    message::Type::Topology => handle_topology(&mut node, tx.clone(), msg).await?,
+                    other => bail!("received unimplemented message {:?}", other),
+                }
             }
-            message::Type::Generate => {
-                handle_generate(&mut node, tx.clone(), msg).await?;
+            _ = retry_interval.tick() => {
+                retry_unacked_gossips(&mut node, tx.clone()).await?;
             }
-            message::Type::Broadcast => {
-                handle_broadcast(&mut node, tx.clone(), msg).await?;
-            }
-            message::Type::GossipBroadcast => {
-                handle_gossip_broadcast(&mut node, tx.clone(), msg).await?;
-            }
-            message::Type::Read => {
-                handle_read(&mut node, tx.clone(), msg).await?;
-            }
-            message::Type::Topology => handle_topology(&mut node, tx.clone(), msg).await?,
-            other => bail!("received unimplemented message {:?}", other),
         }
     }
 
