@@ -2,7 +2,7 @@ mod message;
 mod serde_ext;
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     sync::Arc,
 };
 
@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 
 use crate::message::Message;
 
-const GOSSIP_RESEND_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_millis(50);
+const GOSSIP_RESEND_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_millis(200);
 
 #[derive(Debug)]
 struct UnackedGossip {
@@ -27,7 +27,7 @@ struct UnackedGossip {
 #[derive(Debug)]
 struct Node {
     node_id: Arc<str>,
-    node_ids: Vec<String>,
+    node_ids: Vec<Arc<str>>,
     topology: HashMap<Arc<str>, Vec<Arc<str>>>,
     message_id: u64,
     generate_counter: u64,
@@ -36,7 +36,7 @@ struct Node {
 }
 
 impl Node {
-    fn create(node_id: Arc<str>, node_ids: Vec<String>) -> Self {
+    fn create(node_id: Arc<str>, node_ids: Vec<Arc<str>>) -> Self {
         Node {
             node_id,
             node_ids,
@@ -53,31 +53,6 @@ impl Node {
         self.message_id += 1;
         ret
     }
-}
-
-fn bfs_distances(
-    topology: &HashMap<Arc<str>, Vec<Arc<str>>>,
-    origin: &str,
-) -> HashMap<Arc<str>, u64> {
-    let mut distances = HashMap::new();
-    let mut queue = VecDeque::new();
-
-    if let Some((origin_key, _)) = topology.get_key_value(origin) {
-        distances.insert(origin_key.clone(), 0u64);
-        queue.push_back(origin_key.clone());
-    }
-
-    while let Some(current) = queue.pop_front() {
-        let current_dist = distances[&current];
-        for neighbor in topology.get(current.as_ref()).into_iter().flatten() {
-            if !distances.contains_key(neighbor) {
-                distances.insert(neighbor.clone(), current_dist + 1);
-                queue.push_back(neighbor.clone());
-            }
-        }
-    }
-
-    distances
 }
 
 #[tokio::main]
@@ -151,47 +126,34 @@ async fn handle_generate(
     Ok(())
 }
 
-// Forwards `msg` only to neighbors strictly farther (in hop count) from `origin`
-// than this node is so gossip flows outward from the origin
-async fn propagate_gossip(
+async fn send_gossip(
     node: &mut Node,
     tx: mpsc::Sender<Message>,
     msg: u64,
     origin: &str,
 ) -> Result<()> {
-    let distances = bfs_distances(&node.topology, origin);
-    let Some(&my_dist) = distances.get(node.node_id.as_ref()) else {
-        return Ok(());
-    };
-
-    let neighbors = node
-        .topology
-        .get(node.node_id.as_ref())
+    let peers: Vec<Arc<str>> = node
+        .node_ids
+        .iter()
+        .filter(|id| id.as_ref() != node.node_id.as_ref())
         .cloned()
-        .unwrap_or_default();
+        .collect();
 
-    let mut futures = Vec::with_capacity(neighbors.len());
-    for neighbor in &neighbors {
-        let farther = distances
-            .get(neighbor.as_ref())
-            .is_some_and(|&d| d > my_dist);
-        if !farther {
-            continue;
-        }
+    let mut futures = Vec::with_capacity(peers.len());
+    for peer in &peers {
         let message_id = node.new_message_id();
         let gossip = Message::create(
             node.node_id.clone(),
-            neighbor.clone(),
+            peer.clone(),
             message_id,
             message::Type::GossipBroadcast,
             vec![
                 ("message", serde_json::Value::from(msg)),
                 ("origin", serde_json::Value::String(origin.to_string())),
             ],
-        )
-        .unwrap(); // TODO get rid of this
+        )?;
         let unacked_gossip = UnackedGossip {
-            dest: neighbor.clone(),
+            dest: peer.clone(),
             origin: Arc::from(origin),
             message: msg,
             last_send_time: tokio::time::Instant::now(),
@@ -215,7 +177,7 @@ async fn handle_broadcast(
     tx.send(reply).await?;
 
     let origin = node.node_id.clone();
-    propagate_gossip(node, tx.clone(), message, &origin).await?;
+    send_gossip(node, tx.clone(), message, &origin).await?;
     Ok(())
 }
 
@@ -225,11 +187,7 @@ async fn handle_gossip_broadcast(
     msg: message::Message,
 ) -> Result<()> {
     let message = msg.get("message")?.as_num()?;
-    let origin = msg.get("origin")?.as_string()?;
-    let is_new = node.broadcasted_values.insert(message);
-    if is_new {
-        propagate_gossip(node, tx.clone(), message, origin).await?;
-    }
+    node.broadcasted_values.insert(message);
     let message_id = node.new_message_id();
     let reply = msg.build_reply(message_id, message::Type::GossipBroadcastOk, vec![])?;
     tx.send(reply).await?;
@@ -334,8 +292,8 @@ async fn run_node(mut rx: mpsc::Receiver<Message>, tx: mpsc::Sender<Message>) ->
             let node_ids = init_msg
                 .get("node_ids")?
                 .as_string_array()?
-                .iter()
-                .map(|v| v.to_string())
+                .into_iter()
+                .map(Arc::from)
                 .collect();
             let mut node = Node::create(Arc::from(node_id), node_ids);
             let reply =
