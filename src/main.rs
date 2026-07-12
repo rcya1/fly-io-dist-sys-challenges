@@ -1,23 +1,24 @@
 mod message;
 mod serde_ext;
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    sync::Arc,
+};
 
 use anyhow::{Result, anyhow, bail};
 use futures::future::try_join_all;
-use serde_ext::{SerdeJsonExt, SerdeMapExt};
+use serde_ext::SerdeJsonExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
 use crate::message::Message;
 
-// TODO: make the gossip smarter so we only do a bfs, we know which ones were already sent to so we minimize as much as possible
-
 #[derive(Debug)]
 struct Node {
     node_id: Arc<str>,
     node_ids: Vec<String>,
-    neighbors: Vec<Arc<str>>,
+    topology: HashMap<Arc<str>, Vec<Arc<str>>>,
     message_id: u64,
     generate_counter: u64,
     broadcasted_values: HashSet<u64>,
@@ -28,7 +29,7 @@ impl Node {
         Node {
             node_id,
             node_ids,
-            neighbors: Vec::new(),
+            topology: HashMap::new(),
             message_id: 1,
             generate_counter: 0,
             broadcasted_values: HashSet::new(),
@@ -40,6 +41,31 @@ impl Node {
         self.message_id += 1;
         ret
     }
+}
+
+fn bfs_distances(
+    topology: &HashMap<Arc<str>, Vec<Arc<str>>>,
+    origin: &str,
+) -> HashMap<Arc<str>, u64> {
+    let mut distances = HashMap::new();
+    let mut queue = VecDeque::new();
+
+    if let Some((origin_key, _)) = topology.get_key_value(origin) {
+        distances.insert(origin_key.clone(), 0u64);
+        queue.push_back(origin_key.clone());
+    }
+
+    while let Some(current) = queue.pop_front() {
+        let current_dist = distances[&current];
+        for neighbor in topology.get(current.as_ref()).into_iter().flatten() {
+            if !distances.contains_key(neighbor) {
+                distances.insert(neighbor.clone(), current_dist + 1);
+                queue.push_back(neighbor.clone());
+            }
+        }
+    }
+
+    distances
 }
 
 #[tokio::main]
@@ -113,26 +139,45 @@ async fn handle_generate(
     Ok(())
 }
 
+/// Forwards `msg` only to neighbors strictly farther (in hop count) from `origin`
+/// than this node is, so gossip flows outward from the origin instead of flooding
+/// every edge in both directions.
 async fn propagate_gossip(
     node: &mut Node,
     tx: mpsc::Sender<Message>,
     msg: u64,
-    exclude_id: Option<&str>,
+    origin: &str,
 ) -> Result<()> {
-    let mut futures = Vec::with_capacity(node.neighbors.len());
-    for i in 0..node.neighbors.len() {
-        if let Some(exclude_id) = exclude_id
-            && exclude_id == node.neighbors[i].as_ref()
-        {
+    let distances = bfs_distances(&node.topology, origin);
+    let Some(&my_dist) = distances.get(node.node_id.as_ref()) else {
+        // Topology doesn't (yet) know how to reach us from this origin; nothing to do.
+        return Ok(());
+    };
+
+    let neighbors = node
+        .topology
+        .get(node.node_id.as_ref())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut futures = Vec::with_capacity(neighbors.len());
+    for neighbor in &neighbors {
+        let farther = distances
+            .get(neighbor.as_ref())
+            .is_some_and(|&d| d > my_dist);
+        if !farther {
             continue;
         }
         let message_id = node.new_message_id();
         let gossip = Message::create(
             node.node_id.clone(),
-            node.neighbors[i].clone(),
+            neighbor.clone(),
             message_id,
             message::Type::GossipBroadcast,
-            vec![("message", serde_json::Value::from(msg))],
+            vec![
+                ("message", serde_json::Value::from(msg)),
+                ("origin", serde_json::Value::String(origin.to_string())),
+            ],
         )
         .unwrap();
         futures.push(tx.send(gossip));
@@ -152,7 +197,8 @@ async fn handle_broadcast(
     let reply = msg.build_reply(node.new_message_id(), message::Type::BroadcastOk, vec![])?;
     tx.send(reply).await?;
 
-    propagate_gossip(node, tx.clone(), message, None).await?;
+    let origin = node.node_id.clone();
+    propagate_gossip(node, tx.clone(), message, &origin).await?;
     Ok(())
 }
 
@@ -162,9 +208,10 @@ async fn handle_gossip_broadcast(
     msg: message::Message,
 ) -> Result<()> {
     let message = msg.get("message")?.as_num()?;
+    let origin = msg.get("origin")?.as_string()?;
     let is_new = node.broadcasted_values.insert(message);
     if is_new {
-        propagate_gossip(node, tx.clone(), message, Some(&msg.src)).await?;
+        propagate_gossip(node, tx.clone(), message, origin).await?;
     }
     Ok(())
 }
@@ -195,12 +242,21 @@ async fn handle_topology(
 ) -> Result<()> {
     let reply = msg.build_reply(node.new_message_id(), message::Type::TopologyOk, vec![])?;
     tx.send(reply).await?;
-    let neighbors = msg
+    node.topology = msg
         .get("topology")?
         .as_obj()?
-        .get_key(&node.node_id)?
-        .as_string_array()?;
-    node.neighbors = neighbors.into_iter().map(Arc::from).collect();
+        .iter()
+        .map(
+            |(node_id, neighbors)| -> Result<(Arc<str>, Vec<Arc<str>>)> {
+                let neighbors = neighbors
+                    .as_string_array()?
+                    .into_iter()
+                    .map(Arc::from)
+                    .collect();
+                Ok((Arc::from(node_id.as_str()), neighbors))
+            },
+        )
+        .collect::<Result<_>>()?;
     Ok(())
 }
 

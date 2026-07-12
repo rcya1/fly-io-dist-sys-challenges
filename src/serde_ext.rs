@@ -42,16 +42,3 @@ impl SerdeJsonExt for serde_json::Value {
         Ok(value)
     }
 }
-
-pub trait SerdeMapExt {
-    fn get_key(&self, key: &str) -> Result<&serde_json::Value>;
-}
-
-impl SerdeMapExt for serde_json::Map<String, serde_json::Value> {
-    fn get_key(&self, key: &str) -> Result<&serde_json::Value> {
-        let value = self
-            .get(key)
-            .ok_or_else(|| anyhow!("did not find key {:?} in object", key))?;
-        Ok(value)
-    }
-}
