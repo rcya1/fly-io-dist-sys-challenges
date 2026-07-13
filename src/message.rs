@@ -85,7 +85,7 @@ impl Type {
 pub struct Message {
     pub src: Arc<str>,
     pub dest: Arc<str>,
-    message_id: Option<u64>,
+    pub message_id: Option<u64>,
     pub in_reply_to: Option<u64>,
     pub type_: Type,
     pub data: HashMap<String, serde_json::Value>,

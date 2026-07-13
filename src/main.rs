@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 use crate::message::Message;
 
 const GOSSIP_RESEND_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_millis(200);
+const BUFFER_TIME: tokio::time::Duration = tokio::time::Duration::from_millis(300);
 
 #[derive(Debug)]
 struct UnackedGossip {
@@ -32,6 +33,7 @@ struct Node {
     message_id: u64,
     generate_counter: u64,
     broadcasted_values: HashSet<u64>,
+    buffered_gossips: Vec<Message>,
     unacked_gossips: HashMap<u64, UnackedGossip>,
 }
 
@@ -44,6 +46,7 @@ impl Node {
             message_id: 1,
             generate_counter: 0,
             broadcasted_values: HashSet::new(),
+            buffered_gossips: Vec::new(),
             unacked_gossips: HashMap::new(),
         }
     }
@@ -126,12 +129,7 @@ async fn handle_generate(
     Ok(())
 }
 
-async fn send_gossip(
-    node: &mut Node,
-    tx: mpsc::Sender<Message>,
-    msg: u64,
-    origin: &str,
-) -> Result<()> {
+async fn send_gossip(node: &mut Node, msg: u64, origin: &str) -> Result<()> {
     let peers: Vec<Arc<str>> = node
         .node_ids
         .iter()
@@ -139,7 +137,6 @@ async fn send_gossip(
         .cloned()
         .collect();
 
-    let mut futures = Vec::with_capacity(peers.len());
     for peer in &peers {
         let message_id = node.new_message_id();
         let gossip = Message::create(
@@ -152,14 +149,24 @@ async fn send_gossip(
                 ("origin", serde_json::Value::String(origin.to_string())),
             ],
         )?;
+        node.buffered_gossips.push(gossip);
+    }
+    Ok(())
+}
+
+async fn send_buffered_gossips(node: &mut Node, tx: mpsc::Sender<Message>) -> Result<()> {
+    let buffered_gossips = std::mem::take(&mut node.buffered_gossips);
+    let mut futures = Vec::with_capacity(node.buffered_gossips.len());
+    for buffered_gossip in buffered_gossips {
         let unacked_gossip = UnackedGossip {
-            dest: peer.clone(),
-            origin: Arc::from(origin),
-            message: msg,
+            dest: buffered_gossip.dest.clone(),
+            origin: buffered_gossip.src.clone(),
+            message: buffered_gossip.data["message"].as_u64().unwrap(), // TODO fix
             last_send_time: tokio::time::Instant::now(),
         };
-        node.unacked_gossips.insert(message_id, unacked_gossip);
-        futures.push(tx.send(gossip));
+        node.unacked_gossips
+            .insert(buffered_gossip.message_id.unwrap(), unacked_gossip);
+        futures.push(tx.send(buffered_gossip));
     }
     try_join_all(futures).await?;
     Ok(())
@@ -177,7 +184,7 @@ async fn handle_broadcast(
     tx.send(reply).await?;
 
     let origin = node.node_id.clone();
-    send_gossip(node, tx.clone(), message, &origin).await?;
+    send_gossip(node, message, &origin).await?;
     Ok(())
 }
 
@@ -304,8 +311,10 @@ async fn run_node(mut rx: mpsc::Receiver<Message>, tx: mpsc::Sender<Message>) ->
         other => bail!("received non-init message {:?}", other),
     };
 
-    let mut retry_interval = tokio::time::interval(GOSSIP_RESEND_INTERVAL);
-    retry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut retry_gossip_interval = tokio::time::interval(GOSSIP_RESEND_INTERVAL);
+    retry_gossip_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut send_buffered_gossips_interval = tokio::time::interval(BUFFER_TIME);
+    send_buffered_gossips_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
@@ -334,8 +343,11 @@ async fn run_node(mut rx: mpsc::Receiver<Message>, tx: mpsc::Sender<Message>) ->
                     other => bail!("received unimplemented message {:?}", other),
                 }
             }
-            _ = retry_interval.tick() => {
+            _ = retry_gossip_interval.tick() => {
                 retry_unacked_gossips(&mut node, tx.clone()).await?;
+            }
+            _ = send_buffered_gossips_interval.tick() => {
+                send_buffered_gossips(&mut node, tx.clone()).await?
             }
         }
     }
