@@ -161,7 +161,7 @@ async fn send_buffered_gossips(node: &mut Node, tx: mpsc::Sender<Message>) -> Re
         let unacked_gossip = UnackedGossip {
             dest: buffered_gossip.dest.clone(),
             origin: buffered_gossip.src.clone(),
-            message: buffered_gossip.data["message"].as_u64().unwrap(), // TODO fix
+            message: buffered_gossip.get("message")?.as_num()?,
             last_send_time: tokio::time::Instant::now(),
         };
         node.unacked_gossips
