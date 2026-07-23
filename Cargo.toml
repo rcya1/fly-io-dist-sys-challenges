@@ -3,6 +3,10 @@ name = "gossip-glomers-challenges"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "gossip"
+path = "src/lib.rs"
+
 [dependencies]
 anyhow = "1.0.103"
 futures = "0.3.32"
