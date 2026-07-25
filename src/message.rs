@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Type {
     Init,
     InitOk,
@@ -20,8 +20,14 @@ pub enum Type {
     GossipBroadcastOk,
     Read,
     ReadOk,
+    Write,
+    WriteOk,
+    Cas,
+    CasOk,
     Topology,
     TopologyOk,
+    Add,
+    AddOk,
     Error,
 }
 
@@ -52,8 +58,14 @@ impl Type {
             Type::GossipBroadcastOk => "gossip_broadcast_ok",
             Type::Read => "read",
             Type::ReadOk => "read_ok",
+            Type::Write => "write",
+            Type::WriteOk => "write_ok",
+            Type::Cas => "cas",
+            Type::CasOk => "cas_ok",
             Type::Topology => "topology",
             Type::TopologyOk => "topology_ok",
+            Type::Add => "add",
+            Type::AddOk => "add_ok",
             Type::Error => "error",
         }
     }
@@ -73,8 +85,14 @@ impl Type {
             "gossip_broadcast_ok" => Type::GossipBroadcastOk,
             "read" => Type::Read,
             "read_ok" => Type::ReadOk,
+            "write" => Type::Write,
+            "write_ok" => Type::WriteOk,
+            "cas" => Type::Cas,
+            "cas_ok" => Type::CasOk,
             "topology" => Type::Topology,
             "topology_ok" => Type::TopologyOk,
+            "add" => Type::Add,
+            "add_ok" => Type::AddOk,
             s => bail!("received unknown type {:?}", s),
         };
         Ok(type_)
