@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use anyhow::{Result, bail};
 use gossip::{App, Context, Message, Type, run};
 
@@ -10,7 +12,7 @@ impl App for Echo {
         Echo
     }
 
-    async fn handle(&mut self, ctx: &Context, msg: Message) -> Result<()> {
+    async fn handle(&mut self, ctx: Rc<Context>, msg: Message) -> Result<()> {
         match msg.type_ {
             Type::Echo => {
                 let echo = msg.get("echo")?.clone();

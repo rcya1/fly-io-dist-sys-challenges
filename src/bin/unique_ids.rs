@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use anyhow::{Result, bail};
 use gossip::{App, Context, Message, Type, run};
 use serde_json::Value;
@@ -13,7 +15,7 @@ impl App for UniqueIds {
         UniqueIds { counter: 0 }
     }
 
-    async fn handle(&mut self, ctx: &Context, msg: Message) -> Result<()> {
+    async fn handle(&mut self, ctx: Rc<Context>, msg: Message) -> Result<()> {
         match msg.type_ {
             Type::Generate => {
                 self.counter += 1;

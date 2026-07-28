@@ -197,9 +197,9 @@ pub trait App {
         Vec::new()
     }
 
-    async fn handle(&mut self, ctx: &Context, msg: Message) -> Result<()>;
+    async fn handle(&mut self, ctx: Rc<Context>, msg: Message) -> Result<()>;
 
-    async fn on_timer(&mut self, _ctx: &Context, _timer: Self::Timer) -> Result<()> {
+    async fn on_timer(&mut self, _ctx: Rc<Context>, _timer: Self::Timer) -> Result<()> {
         Ok(())
     }
 }
@@ -268,8 +268,8 @@ async fn run_node<A: App + 'static>(
         let mut app = A::init(&app_ctx);
         while let Some(event) = app_rx.recv().await {
             match event {
-                AppEvent::Message(msg) => app.handle(&app_ctx, msg).await?,
-                AppEvent::Timer(timer) => app.on_timer(&app_ctx, timer).await?,
+                AppEvent::Message(msg) => app.handle(app_ctx.clone(), msg).await?,
+                AppEvent::Timer(timer) => app.on_timer(app_ctx.clone(), timer).await?,
             }
         }
         Ok::<(), anyhow::Error>(())

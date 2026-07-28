@@ -28,6 +28,14 @@ pub enum Type {
     TopologyOk,
     Add,
     AddOk,
+    Send,
+    SendOk,
+    Poll,
+    PollOk,
+    CommitOffsets,
+    CommitOffsetsOk,
+    ListCommittedOffsets,
+    ListCommittedOffsetsOk,
     Error,
 }
 
@@ -66,6 +74,14 @@ impl Type {
             Type::TopologyOk => "topology_ok",
             Type::Add => "add",
             Type::AddOk => "add_ok",
+            Type::Send => "send",
+            Type::SendOk => "send_ok",
+            Type::Poll => "poll",
+            Type::PollOk => "poll_ok",
+            Type::CommitOffsets => "commit_offsets",
+            Type::CommitOffsetsOk => "commit_offsets_ok",
+            Type::ListCommittedOffsets => "list_committed_offsets",
+            Type::ListCommittedOffsetsOk => "list_committed_offsets_ok",
             Type::Error => "error",
         }
     }
@@ -93,6 +109,14 @@ impl Type {
             "topology_ok" => Type::TopologyOk,
             "add" => Type::Add,
             "add_ok" => Type::AddOk,
+            "send" => Type::Send,
+            "send_ok" => Type::SendOk,
+            "poll" => Type::Poll,
+            "poll_ok" => Type::PollOk,
+            "commit_offsets" => Type::CommitOffsets,
+            "commit_offsets_ok" => Type::CommitOffsetsOk,
+            "list_committed_offsets" => Type::ListCommittedOffsets,
+            "list_committed_offsets_ok" => Type::ListCommittedOffsetsOk,
             s => bail!("received unknown type {:?}", s),
         };
         Ok(type_)

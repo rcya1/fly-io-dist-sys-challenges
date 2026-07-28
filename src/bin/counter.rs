@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use anyhow::{Result, anyhow, bail};
 use gossip::constants::LinKv;
 use gossip::kv::{KvClient, KvError};
@@ -13,8 +15,8 @@ impl App for Counter {
         Counter
     }
 
-    async fn handle(&mut self, ctx: &Context, msg: Message) -> Result<()> {
-        let kv = KvClient::<LinKv>::new(ctx);
+    async fn handle(&mut self, ctx: Rc<Context>, msg: Message) -> Result<()> {
+        let kv = KvClient::<LinKv>::new(ctx.as_ref());
         match msg.type_ {
             Type::Add => {
                 let delta = msg
@@ -23,7 +25,11 @@ impl App for Counter {
                     .ok_or_else(|| anyhow!("delta is not an integer"))?;
 
                 loop {
-                    let current = kv.read("counter").await?.and_then(|v| v.as_i64()).unwrap_or(0);
+                    let current = kv
+                        .read("counter")
+                        .await?
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
                     let updated = current + delta;
                     let cas = kv
                         .cas(
@@ -43,7 +49,11 @@ impl App for Counter {
                 ctx.reply(&msg, Type::AddOk, vec![]).await
             }
             Type::Read => {
-                let value = kv.read("counter").await?.and_then(|v| v.as_i64()).unwrap_or(0);
+                let value = kv
+                    .read("counter")
+                    .await?
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
                 ctx.reply(
                     &msg,
                     Type::ReadOk,

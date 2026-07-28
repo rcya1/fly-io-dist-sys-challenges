@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,21 +51,21 @@ impl<const BUFFERED: bool> App for Broadcast<BUFFERED> {
         timers
     }
 
-    async fn handle(&mut self, ctx: &Context, msg: Message) -> Result<()> {
+    async fn handle(&mut self, ctx: Rc<Context>, msg: Message) -> Result<()> {
         match msg.type_ {
-            Type::Broadcast => self.on_broadcast(ctx, msg).await,
-            Type::GossipBroadcast => self.on_gossip(ctx, msg).await,
+            Type::Broadcast => self.on_broadcast(&ctx, msg).await,
+            Type::GossipBroadcast => self.on_gossip(&ctx, msg).await,
             Type::GossipBroadcastOk => self.on_gossip_ok(msg),
-            Type::Read => self.on_read(ctx, msg).await,
+            Type::Read => self.on_read(&ctx, msg).await,
             Type::Topology => ctx.reply(&msg, Type::TopologyOk, vec![]).await,
             other => bail!("unexpected message {:?}", other),
         }
     }
 
-    async fn on_timer(&mut self, ctx: &Context, timer: Timer) -> Result<()> {
+    async fn on_timer(&mut self, ctx: Rc<Context>, timer: Timer) -> Result<()> {
         match timer {
-            Timer::Retry => self.retry(ctx).await,
-            Timer::Flush => self.flush(ctx).await,
+            Timer::Retry => self.retry(&ctx).await,
+            Timer::Flush => self.flush(&ctx).await,
         }
     }
 }
