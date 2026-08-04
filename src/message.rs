@@ -36,6 +36,12 @@ pub enum Type {
     CommitOffsetsOk,
     ListCommittedOffsets,
     ListCommittedOffsetsOk,
+    Txn,
+    TxnOk,
+    GossipTxn,
+    GossipTxnOk,
+    Sync,
+    SyncOk,
     Error,
 }
 
@@ -82,6 +88,12 @@ impl Type {
             Type::CommitOffsetsOk => "commit_offsets_ok",
             Type::ListCommittedOffsets => "list_committed_offsets",
             Type::ListCommittedOffsetsOk => "list_committed_offsets_ok",
+            Type::Txn => "txn",
+            Type::TxnOk => "txn_ok",
+            Type::GossipTxn => "gossip_txn",
+            Type::GossipTxnOk => "gossip_txn_ok",
+            Type::Sync => "sync",
+            Type::SyncOk => "sync_ok",
             Type::Error => "error",
         }
     }
@@ -117,6 +129,12 @@ impl Type {
             "commit_offsets_ok" => Type::CommitOffsetsOk,
             "list_committed_offsets" => Type::ListCommittedOffsets,
             "list_committed_offsets_ok" => Type::ListCommittedOffsetsOk,
+            "txn" => Type::Txn,
+            "txn_ok" => Type::TxnOk,
+            "gossip_txn" => Type::GossipTxn,
+            "gossip_txn_ok" => Type::GossipTxnOk,
+            "sync" => Type::Sync,
+            "sync_ok" => Type::SyncOk,
             s => bail!("received unknown type {:?}", s),
         };
         Ok(type_)

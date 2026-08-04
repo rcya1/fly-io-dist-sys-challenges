@@ -1,7 +1,10 @@
 use std::fmt::{self, Display};
 use std::marker::PhantomData;
+use std::rc::Rc;
+use std::time::Duration;
 
 use serde_json::Value;
+use tokio::time::sleep;
 
 use crate::constants::{ErrorCode, KvStoreName};
 use crate::framework::{Context, RetryPolicy, RpcError};
@@ -50,14 +53,20 @@ impl From<RpcError> for KvError {
     }
 }
 
-pub struct KvClient<'a, S: KvStoreName> {
-    ctx: &'a Context,
+pub enum CasStep<T> {
+    Wait(Duration),
+    Apply(Value, T),
+    Done(T),
+}
+
+pub struct KvClient<S: KvStoreName> {
+    ctx: Rc<Context>,
     retry: RetryPolicy,
     _store: PhantomData<S>,
 }
 
-impl<'a, S: KvStoreName> KvClient<'a, S> {
-    pub fn new(ctx: &'a Context) -> Self {
+impl<S: KvStoreName> KvClient<S> {
+    pub fn new(ctx: Rc<Context>) -> Self {
         KvClient {
             ctx,
             retry: RetryPolicy::default(),
@@ -122,5 +131,45 @@ impl<'a, S: KvStoreName> KvClient<'a, S> {
             )
             .await?;
         Ok(())
+    }
+
+    pub async fn cas_loop<T, F, D>(
+        &self,
+        key: &str,
+        create_if_not_exists: bool,
+        initial_guess: Option<Value>,
+        default: D,
+        mut compute: F,
+    ) -> Result<T, KvError>
+    where
+        D: Fn() -> Value,
+        F: FnMut(&Value) -> Result<CasStep<T>, KvError>,
+    {
+        let mut current = initial_guess;
+        loop {
+            let from = match current.take() {
+                Some(v) => v,
+                None => self.read(key).await?.unwrap_or_else(&default),
+            };
+            let (to, extra) = match compute(&from)? {
+                CasStep::Apply(to, extra) => (to, extra),
+                CasStep::Done(extra) => return Ok(extra),
+                CasStep::Wait(duration) => {
+                    sleep(duration).await;
+                    continue;
+                }
+            };
+            match self.cas(key, from, to.clone(), create_if_not_exists).await {
+                Ok(()) => return Ok(extra),
+                Err(KvError::PreconditionFailed) => {
+                    let fresh = self.read(key).await?;
+                    if fresh.as_ref() == Some(&to) {
+                        return Ok(extra);
+                    }
+                    current = Some(fresh.unwrap_or_else(&default));
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 }

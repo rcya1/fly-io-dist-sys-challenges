@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 use gossip::constants::{LinKv, SeqKv};
-use gossip::kv::{KvClient, KvError};
+use gossip::kv::{CasStep, KvClient};
 use gossip::{App, Context, Message, RetryPolicy, Type, run};
 use serde_json::{Map, Number, Value};
 use tokio::sync::Notify;
@@ -79,10 +79,12 @@ impl App for Kafka {
 
     async fn handle(&mut self, ctx: Rc<Context>, msg: Message) -> Result<()> {
         match msg.type_ {
-            Type::Send => self.handle_send(ctx, msg).await,
-            Type::Poll => self.handle_poll(&ctx, msg).await,
-            Type::CommitOffsets => self.handle_commit_offsets(&ctx, msg).await,
-            Type::ListCommittedOffsets => self.handle_list_committed_offsets(&ctx, msg).await,
+            Type::Send => self.handle_send(ctx.clone(), msg).await,
+            Type::Poll => self.handle_poll(ctx.clone(), msg).await,
+            Type::CommitOffsets => self.handle_commit_offsets(ctx.clone(), msg).await,
+            Type::ListCommittedOffsets => {
+                self.handle_list_committed_offsets(ctx.clone(), msg).await
+            }
             other => bail!("unexpected message {:?}", other),
         }
     }
@@ -124,7 +126,7 @@ impl Kafka {
 
     /// Ensures the local cache is not stale for each given key, then uses the
     /// cache to answer the query
-    async fn handle_poll(&mut self, ctx: &Context, msg: Message) -> Result<()> {
+    async fn handle_poll(&mut self, ctx: Rc<Context>, msg: Message) -> Result<()> {
         let offsets = msg
             .get("offsets")?
             .as_object()
@@ -136,7 +138,7 @@ impl Kafka {
             let start_offset = start_offset
                 .as_u64()
                 .ok_or_else(|| anyhow!("start offset is not a u64"))?;
-            ensure_cached_not_stale(ctx, &self.logs, key).await?;
+            ensure_cached_not_stale(ctx.clone(), &self.logs, key).await?;
 
             let entries: Vec<Value> = {
                 let logs = self.logs.borrow();
@@ -164,14 +166,14 @@ impl Kafka {
     }
 
     /// Update the offset in the cache + seq-kv
-    async fn handle_commit_offsets(&mut self, ctx: &Context, msg: Message) -> Result<()> {
+    async fn handle_commit_offsets(&mut self, ctx: Rc<Context>, msg: Message) -> Result<()> {
         let offsets = msg
             .get("offsets")?
             .as_object()
             .ok_or_else(|| anyhow!("offsets is not an object"))?
             .clone();
 
-        let kv = KvClient::<SeqKv>::new(ctx);
+        let kv = KvClient::<SeqKv>::new(ctx.clone());
         for (key, offset) in &offsets {
             let offset = offset
                 .as_u64()
@@ -187,7 +189,11 @@ impl Kafka {
     }
 
     /// If the cache isn't too far out of date, use it. Otherwise query seq-kv
-    async fn handle_list_committed_offsets(&mut self, ctx: &Context, msg: Message) -> Result<()> {
+    async fn handle_list_committed_offsets(
+        &mut self,
+        ctx: Rc<Context>,
+        msg: Message,
+    ) -> Result<()> {
         let keys = msg
             .get("keys")?
             .as_array()
@@ -200,7 +206,7 @@ impl Kafka {
             })
             .collect::<Result<Vec<String>>>()?;
 
-        let kv = KvClient::<SeqKv>::new(ctx);
+        let kv = KvClient::<SeqKv>::new(ctx.clone());
         let mut result = Map::new();
         for key in keys {
             let fresh_enough = {
@@ -258,7 +264,7 @@ fn empty_log_value() -> Value {
 
 /// Ensures the currently cached data for `key` is not stale
 async fn ensure_cached_not_stale(
-    ctx: &Context,
+    ctx: Rc<Context>,
     logs: &Rc<RefCell<HashMap<String, LogState>>>,
     key: &str,
 ) -> Result<()> {
@@ -271,7 +277,7 @@ async fn ensure_cached_not_stale(
         }
     }
 
-    let kv = KvClient::<LinKv>::new(ctx);
+    let kv = KvClient::<LinKv>::new(ctx.clone());
     let fetched = kv
         .read(&log_key(key))
         .await?
@@ -317,7 +323,7 @@ fn spawn_flush_worker(
                 break;
             }
 
-            if let Err(err) = flush_key(&ctx, &logs, &key, entries).await {
+            if let Err(err) = flush_key(ctx.clone(), logs.clone(), &key, entries).await {
                 eprintln!("flush of {key} failed permanently: {err}");
             }
         }
@@ -328,12 +334,12 @@ fn spawn_flush_worker(
 /// Assigns offsets to `entries` and durably stores them in lin-kv, all as a
 /// single CAS
 async fn flush_key(
-    ctx: &Context,
-    logs: &Rc<RefCell<HashMap<String, LogState>>>,
+    ctx: Rc<Context>,
+    logs: Rc<RefCell<HashMap<String, LogState>>>,
     key: &str,
     entries: Vec<PendingEntry>,
 ) -> Result<()> {
-    let kv = KvClient::<LinKv>::new(ctx).with_retry(RetryPolicy {
+    let kv = KvClient::<LinKv>::new(ctx.clone()).with_retry(RetryPolicy {
         max_attempts: u32::MAX,
         per_attempt_timeout: Duration::from_millis(500),
         backoff: Duration::from_millis(200),
@@ -342,62 +348,47 @@ async fn flush_key(
 
     // Start from our last known value to try to skip an upfront read in the
     // common case where noone else has written
-    let mut guess: Option<Value> = {
+    let guess: Option<Value> = {
         let logs = logs.borrow();
         logs.get(key)
             .and_then(|s| s.cached_log.as_ref())
             .map(|c| c.raw.clone())
     };
 
-    let (assigned_offsets, new_value) = loop {
-        let from_value = match guess.take() {
-            Some(v) => v,
-            None => kv.read(&log_key).await?.unwrap_or_else(empty_log_value),
-        };
-        let (next_offset, existing_entries) = match &from_value {
-            Value::Object(obj) => {
-                let next_offset = obj.get("next_offset").and_then(|v| v.as_u64()).unwrap_or(0);
-                let existing = match obj.get("entries") {
-                    Some(Value::Object(m)) => m.clone(),
-                    _ => Map::new(),
-                };
-                (next_offset, existing)
-            }
-            _ => (0, Map::new()),
-        };
-
-        let mut new_entries = existing_entries;
-        let mut offset = next_offset;
-        let mut offsets = Vec::with_capacity(entries.len());
-        for entry in &entries {
-            new_entries.insert(offset.to_string(), entry.payload.clone());
-            offsets.push(offset);
-            offset += 1;
-        }
-        let to_value = Value::Object(Map::from_iter([
-            (
-                "next_offset".to_string(),
-                Value::Number(Number::from(offset)),
-            ),
-            ("entries".to_string(), Value::Object(new_entries)),
-        ]));
-
-        match kv.cas(&log_key, from_value, to_value.clone(), true).await {
-            Ok(()) => break (offsets, to_value),
-            Err(KvError::PreconditionFailed) => {
-                // Check if the existing write is what we would have written (i.e.
-                // a prev request succeeded and the response was lost).
-                let fresh = kv.read(&log_key).await?;
-                if fresh.as_ref() == Some(&to_value) {
-                    break (offsets, to_value);
+    let (assigned_offsets, new_value) = kv
+        .cas_loop(&log_key, true, guess, empty_log_value, |from_value| {
+            let (next_offset, existing_entries) = match from_value {
+                Value::Object(obj) => {
+                    let next_offset = obj.get("next_offset").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let existing = match obj.get("entries") {
+                        Some(Value::Object(m)) => m.clone(),
+                        _ => Map::new(),
+                    };
+                    (next_offset, existing)
                 }
-                // Otherwise use this read as the next attempt's starting point
-                guess = Some(fresh.unwrap_or_else(empty_log_value));
-                continue;
+                _ => (0, Map::new()),
+            };
+
+            let mut new_entries = existing_entries;
+            let mut offset = next_offset;
+            let mut offsets = Vec::with_capacity(entries.len());
+            for entry in &entries {
+                new_entries.insert(offset.to_string(), entry.payload.clone());
+                offsets.push(offset);
+                offset += 1;
             }
-            Err(e) => bail!("failed to flush {key}: {e}"),
-        }
-    };
+            let to_value = Value::Object(Map::from_iter([
+                (
+                    "next_offset".to_string(),
+                    Value::Number(Number::from(offset)),
+                ),
+                ("entries".to_string(), Value::Object(new_entries)),
+            ]));
+
+            Ok(CasStep::Apply(to_value.clone(), (offsets, to_value)))
+        })
+        .await
+        .map_err(|e| anyhow!("failed to flush {key}: {e}"))?;
 
     {
         let mut logs = logs.borrow_mut();

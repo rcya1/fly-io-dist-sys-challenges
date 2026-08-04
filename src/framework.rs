@@ -197,6 +197,14 @@ pub trait App {
         Vec::new()
     }
 
+    /// Runs once after `init`, before any messages are pulled off the
+    /// queue — so an implementation that awaits here (e.g. an RPC) holds up
+    /// message processing until it resolves, with no interior mutability
+    /// needed since nothing else can run concurrently with it.
+    async fn on_start(&mut self, _ctx: Rc<Context>) -> Result<()> {
+        Ok(())
+    }
+
     async fn handle(&mut self, ctx: Rc<Context>, msg: Message) -> Result<()>;
 
     async fn on_timer(&mut self, _ctx: Rc<Context>, _timer: Self::Timer) -> Result<()> {
@@ -266,6 +274,7 @@ async fn run_node<A: App + 'static>(
     let app_ctx = ctx.clone();
     let app_task = tokio::task::spawn_local(async move {
         let mut app = A::init(&app_ctx);
+        app.on_start(app_ctx.clone()).await?;
         while let Some(event) = app_rx.recv().await {
             match event {
                 AppEvent::Message(msg) => app.handle(app_ctx.clone(), msg).await?,
