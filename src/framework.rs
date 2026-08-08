@@ -197,10 +197,6 @@ pub trait App {
         Vec::new()
     }
 
-    /// Runs once after `init`, before any messages are pulled off the
-    /// queue — so an implementation that awaits here (e.g. an RPC) holds up
-    /// message processing until it resolves, with no interior mutability
-    /// needed since nothing else can run concurrently with it.
     async fn on_start(&mut self, _ctx: Rc<Context>) -> Result<()> {
         Ok(())
     }
