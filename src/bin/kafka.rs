@@ -33,9 +33,7 @@ struct CachedLog {
 }
 
 /// This node's cached view of a key's committed offset. Source of truth is
-/// in seq-kv. `offset` is `None` when a real read confirmed nothing has been
-/// committed yet — that's just as cacheable/TTL-bounded as a real offset, no
-/// need to treat "not committed" as an uncached special case.
+/// in seq-kv
 struct CachedCommit {
     offset: Option<u64>,
     last_fetched: Instant,
