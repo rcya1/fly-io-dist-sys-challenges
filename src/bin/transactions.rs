@@ -49,9 +49,7 @@ impl App for Transactions {
     }
 
     /// Blocks message processing until every peer has answered or timed
-    /// out, merging in whatever each one has, so a node that just crashed
-    /// and restarted with an empty map never serves a request off its
-    /// stale/empty state.
+    /// out
     async fn on_start(&mut self, ctx: Rc<Context>) -> Result<()> {
         let retry = RetryPolicy {
             max_attempts: 1,
