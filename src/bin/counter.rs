@@ -2,7 +2,7 @@ use std::rc::Rc;
 
 use anyhow::{Result, anyhow, bail};
 use gossip::constants::SeqKv;
-use gossip::kv::{CasStep, KvClient};
+use gossip::kv::KvClient;
 use gossip::{App, Context, Message, Type, run};
 use serde_json::{Number, Value};
 
@@ -24,34 +24,24 @@ impl App for Counter {
                     .as_i64()
                     .ok_or_else(|| anyhow!("delta is not an integer"))?;
 
-                kv.cas_loop(
-                    "counter",
-                    true,
-                    None,
-                    || Value::Number(Number::from(0)),
-                    |current| {
-                        let current = current
-                            .as_i64()
-                            .ok_or_else(|| anyhow!("counter value is not an integer"))?;
-                        let updated = Value::Number(Number::from(current + delta));
-                        Ok(CasStep::Apply(updated, ()))
-                    },
-                )
-                .await
-                .map_err(|e| anyhow!("cas on counter failed: {e}"))?;
+                let key = format!("counter-{}", ctx.node_id);
+                let current = kv.read(&key).await?.and_then(|v| v.as_i64()).unwrap_or(0);
+                kv.write(&key, Value::Number(Number::from(current + delta)))
+                    .await
+                    .map_err(|e| anyhow!("write on {key} failed: {e}"))?;
 
                 ctx.reply(&msg, Type::AddOk, vec![]).await
             }
             Type::Read => {
-                let value = kv
-                    .read("counter")
-                    .await?
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
+                let mut total = 0i64;
+                for node_id in &ctx.node_ids {
+                    let key = format!("counter-{node_id}");
+                    total += kv.read(&key).await?.and_then(|v| v.as_i64()).unwrap_or(0);
+                }
                 ctx.reply(
                     &msg,
                     Type::ReadOk,
-                    vec![("value", Value::Number(Number::from(value)))],
+                    vec![("value", Value::Number(Number::from(total)))],
                 )
                 .await
             }
