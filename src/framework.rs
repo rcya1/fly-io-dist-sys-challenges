@@ -273,8 +273,16 @@ async fn run_node<A: App + 'static>(
         app.on_start(app_ctx.clone()).await?;
         while let Some(event) = app_rx.recv().await {
             match event {
-                AppEvent::Message(msg) => app.handle(app_ctx.clone(), msg).await?,
-                AppEvent::Timer(timer) => app.on_timer(app_ctx.clone(), timer).await?,
+                AppEvent::Message(msg) => {
+                    if let Err(err) = app.handle(app_ctx.clone(), msg).await {
+                        eprintln!("message handler failed: {err}");
+                    }
+                }
+                AppEvent::Timer(timer) => {
+                    if let Err(err) = app.on_timer(app_ctx.clone(), timer).await {
+                        eprintln!("timer handler failed: {err}");
+                    }
+                }
             }
         }
         Ok::<(), anyhow::Error>(())
