@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -31,9 +31,23 @@ enum Timer {
     AntiEntropy,
 }
 
+#[derive(Clone)]
+struct Versioned {
+    value: i64,
+    ts: u64,
+    node: Arc<str>,
+}
+
+impl Versioned {
+    fn supersedes(&self, other: &Versioned) -> bool {
+        (self.ts, &*self.node) > (other.ts, &*other.node)
+    }
+}
+
 #[derive(Default)]
 struct Transactions {
-    committed: Rc<RefCell<HashMap<i64, i64>>>,
+    committed: Rc<RefCell<HashMap<i64, Versioned>>>,
+    clock: Rc<Cell<u64>>,
 }
 
 impl App for Transactions {
@@ -69,9 +83,7 @@ impl App for Transactions {
             let Ok(state) = reply.get("state").and_then(parse_kv_store) else {
                 continue;
             };
-            for (key, value) in state {
-                committed.entry(key).or_insert(value);
-            }
+            merge(&mut committed, &self.clock, state);
         }
         Ok(())
     }
@@ -98,6 +110,12 @@ impl App for Transactions {
 }
 
 impl Transactions {
+    fn tick(&self) -> u64 {
+        let ts = self.clock.get() + 1;
+        self.clock.set(ts);
+        ts
+    }
+
     async fn handle_txn(&mut self, ctx: &Context, msg: Message) -> Result<()> {
         let ops = msg
             .get("txn")?
@@ -123,10 +141,12 @@ impl Transactions {
                 .ok_or_else(|| anyhow!("op key is not an integer"))?;
             match kind {
                 OpKind::Read => {
-                    let value = buffer
-                        .get(&key)
-                        .copied()
-                        .or_else(|| self.committed.borrow().get(&key).copied());
+                    let value = buffer.get(&key).copied().or_else(|| {
+                        self.committed
+                            .borrow()
+                            .get(&key)
+                            .map(|version| version.value)
+                    });
                     let value = value
                         .map(|v| Value::Number(Number::from(v)))
                         .unwrap_or(Value::Null);
@@ -146,17 +166,28 @@ impl Transactions {
             }
         }
 
-        {
+        let ts = self.tick();
+        let writes: HashMap<i64, Versioned> = buffer
+            .into_iter()
+            .map(|(key, value)| {
+                let version = Versioned {
+                    value,
+                    ts,
+                    node: ctx.node_id.clone(),
+                };
+                (key, version)
+            })
+            .collect();
+
+        let changed = {
             let mut committed = self.committed.borrow_mut();
-            for (&key, &value) in &buffer {
-                committed.insert(key, value);
-            }
-        }
+            merge(&mut committed, &self.clock, writes)
+        };
 
         // send gossips but don't wait for acks. Otherwise we don't get total
         // availability during partitions
-        if !buffer.is_empty() {
-            gossip(ctx, buffer, None).await?;
+        if !changed.is_empty() {
+            gossip(ctx, changed, None).await?;
         }
 
         ctx.reply(&msg, Type::TxnOk, vec![("txn", Value::Array(result))])
@@ -166,18 +197,12 @@ impl Transactions {
     async fn on_gossip(&mut self, ctx: &Context, msg: Message) -> Result<()> {
         let writes = parse_kv_store(msg.get("writes")?)?;
 
-        let mut changed: HashMap<i64, i64> = HashMap::new();
-        {
+        let changed = {
             let mut committed = self.committed.borrow_mut();
-            for (key, value) in writes {
-                if committed.get(&key) != Some(&value) {
-                    committed.insert(key, value);
-                    changed.insert(key, value);
-                }
-            }
-        }
+            merge(&mut committed, &self.clock, writes)
+        };
 
-        // propagate to our neighbors
+        // propagate to our neighbors. A write we already lost to stops here
         if !changed.is_empty() {
             gossip(ctx, changed, Some(&msg.src)).await?;
         }
@@ -189,14 +214,14 @@ impl Transactions {
         ctx.reply(&msg, Type::SyncOk, vec![("state", state)]).await
     }
 
-    /// Periodically pulls a full snapshot from every peer and fills in
-    /// anything missing
+    /// Periodically pulls a full snapshot from every peer and merges it in
     fn spawn_anti_entropy(&self, ctx: Rc<Context>) {
         let peers: Vec<Arc<str>> = ctx.peers().cloned().collect();
         if peers.is_empty() {
             return;
         }
         let committed = self.committed.clone();
+        let clock = self.clock.clone();
         tokio::task::spawn_local(async move {
             let retry = RetryPolicy {
                 max_attempts: 1,
@@ -215,16 +240,40 @@ impl Transactions {
                 let Ok(state) = reply.get("state").and_then(parse_kv_store) else {
                     continue;
                 };
-                for (key, value) in state {
-                    committed.entry(key).or_insert(value);
-                }
+                merge(&mut committed, &clock, state);
             }
         });
     }
 }
 
+/// Applies incoming writes, keeping the winner of each key and raising our
+/// clock past every stamp we have seen. Returns only what actually changed
+fn merge(
+    committed: &mut HashMap<i64, Versioned>,
+    clock: &Cell<u64>,
+    incoming: HashMap<i64, Versioned>,
+) -> HashMap<i64, Versioned> {
+    let mut changed = HashMap::new();
+    for (key, version) in incoming {
+        clock.set(clock.get().max(version.ts));
+        if committed
+            .get(&key)
+            .is_some_and(|current| !version.supersedes(current))
+        {
+            continue;
+        }
+        committed.insert(key, version.clone());
+        changed.insert(key, version);
+    }
+    changed
+}
+
 /// Relay writes to all peers without waiting for acks
-async fn gossip(ctx: &Context, writes: HashMap<i64, i64>, except: Option<&Arc<str>>) -> Result<()> {
+async fn gossip(
+    ctx: &Context,
+    writes: HashMap<i64, Versioned>,
+    except: Option<&Arc<str>>,
+) -> Result<()> {
     let data = serialize_kv_store(&writes);
     for peer in ctx.peers() {
         if except.is_some_and(|e| e.as_ref() == peer.as_ref()) {
@@ -240,16 +289,23 @@ async fn gossip(ctx: &Context, writes: HashMap<i64, i64>, except: Option<&Arc<st
     Ok(())
 }
 
-fn serialize_kv_store(writes: &HashMap<i64, i64>) -> Value {
+fn serialize_kv_store(writes: &HashMap<i64, Versioned>) -> Value {
     Value::Object(
         writes
             .iter()
-            .map(|(k, v)| (k.to_string(), Value::Number(Number::from(*v))))
+            .map(|(k, v)| {
+                let version = Value::Array(vec![
+                    Value::Number(Number::from(v.value)),
+                    Value::Number(Number::from(v.ts)),
+                    Value::String(v.node.to_string()),
+                ]);
+                (k.to_string(), version)
+            })
             .collect(),
     )
 }
 
-fn parse_kv_store(v: &Value) -> Result<HashMap<i64, i64>> {
+fn parse_kv_store(v: &Value) -> Result<HashMap<i64, Versioned>> {
     let obj = v
         .as_object()
         .ok_or_else(|| anyhow!("writes is not an object"))?;
@@ -258,10 +314,24 @@ fn parse_kv_store(v: &Value) -> Result<HashMap<i64, i64>> {
             let key = k
                 .parse::<i64>()
                 .map_err(|_| anyhow!("write key {:?} is not an integer", k))?;
-            let value = v
+            let Some([value, ts, node]) = v.as_array().map(Vec::as_slice) else {
+                bail!("write for key {k} is not a [value, ts, node] triple");
+            };
+            let value = value
                 .as_i64()
                 .ok_or_else(|| anyhow!("write value for key {k} is not an integer"))?;
-            Ok((key, value))
+            let ts = ts
+                .as_u64()
+                .ok_or_else(|| anyhow!("write ts for key {k} is not an integer"))?;
+            let node = node
+                .as_str()
+                .ok_or_else(|| anyhow!("write node for key {k} is not a string"))?;
+            let version = Versioned {
+                value,
+                ts,
+                node: Arc::from(node),
+            };
+            Ok((key, version))
         })
         .collect()
 }
